@@ -14,9 +14,8 @@ from torch.utils.tensorboard import SummaryWriter
 from util import lr_decay as lrd, misc
 from util.misc import NativeScalerWithGradNormCount as NativeScaler
 import models
-from models import EDMLoss
 
-from utils import *
+from train_utils import *
 import trimesh
 
 import math
@@ -167,79 +166,93 @@ def train_one_epoch(model: torch.nn.Module,
                     criterion,
                     device: torch.device, epoch: int, loss_scaler, max_norm: float = 0,
                     log_writer=None, args=None):
+    # Set the model to training mode
     model.train(True)
+
+    # Initialize metric logger
     metric_logger = misc.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', misc.SmoothedValue(window_size=1, fmt='{value:.6f}'))
-    header = 'Epoch: [{}]'.format(epoch)
+    header = f'Epoch: [{epoch}]'
     print_freq = 20
-    
-    accum_iter = args.accum_iter
 
+    # Gradient accumulation setup
+    accum_iter = args.accum_iter
     optimizer.zero_grad()
 
+    # Log directory if log_writer is provided
     if log_writer is not None:
-        print('log_dir: {}'.format(log_writer.log_dir))
+        print(f'log_dir: {log_writer.log_dir}')
     
     print(data_loader)
 
+    # Initialize noise and samples
     noise = None
 
+    # Handle data loader setup
     if isinstance(data_loader, dict):
         obj_file = data_loader['obj_file']
         batch_size = data_loader['batch_size']
 
+        # Load samples from an object file
         if obj_file is not None:
-            if obj_file.endswith('.obj'):
-                mesh = trimesh.load(obj_file)
+            mesh = trimesh.load(obj_file)
+            if len(mesh.faces)>0:
                 if data_loader['texture_path'] is not None:
+                    # Load texture and apply it to the mesh
                     img = Image.open(data_loader['texture_path'])
                     material = trimesh.visual.texture.SimpleMaterial(image=img)
                     assert mesh.visual.uv is not None
                     texture = trimesh.visual.TextureVisuals(mesh.visual.uv, image=img, material=material)
                     mesh = trimesh.Trimesh(vertices=mesh.vertices, faces=mesh.faces, visual=texture, process=False)
 
-                    samples, _, colors = trimesh.sample.sample_surface(mesh,  2048*64*4*64, sample_color=True)
-                    colors = colors[:, :3] # remove alpha
-                    colors = (colors.astype(np.float32) / 255.0 - 0.5)  / np.sqrt(1/12) # [-1, 1]
+                    # Sample points and colors from the mesh
+                    samples, _, colors = trimesh.sample.sample_surface(mesh, 2048 * 64 * 4 * 64, sample_color=True)
+                    colors = colors[:, :3]  # Remove alpha channel
+                    colors = (colors.astype(np.float32) / 255.0 - 0.5) / np.sqrt(1 / 12)  # Normalize colors
                     samples = np.concatenate([samples, colors], axis=1)
                 else:
-                    samples, _ = trimesh.sample.sample_surface(mesh,  2048*64*4*64)
+                    # Sample points from the mesh without texture
+                    samples, _ = trimesh.sample.sample_surface(mesh, 2048 * 64 * 4 * 64)
             else:
-                samples = trimesh.load(obj_file).vertices
-
+                samples = mesh.vertices
+        # Generate primitive shapes if no object file is provided
         else:
             if data_loader['primitive'] == 'sphere':
-                n = torch.randn(2048*64*4*64, 3)
+                n = torch.randn(2048 * 64 * 4 * 64, 3)
                 n = torch.nn.functional.normalize(n, dim=1)
-                samples = n / np.sqrt(1/3)
+                samples = n / np.sqrt(1 / 3)
                 samples = samples.numpy()
             elif data_loader['primitive'] == 'plane':
-                samples = torch.rand(2048*64*4*64, 3) - 0.5
+                samples = torch.rand(2048 * 64 * 4 * 64, 3) - 0.5
                 samples[:, 2] = 0
-                samples = (samples - 0) / np.sqrt(2/9*2*0.5**3)
+                samples = (samples - 0) / np.sqrt(2 / 9 * 2 * 0.5 ** 3)
                 samples = samples.numpy()
             elif data_loader['primitive'] == 'volume':
-                samples = (torch.rand(2048*64*4*64, 3) - 0.5) / np.sqrt(1/12) 
+                samples = (torch.rand(2048 * 64 * 4 * 64, 3) - 0.5) / np.sqrt(1 / 12)
                 samples = samples.numpy()
             elif data_loader['primitive'] == 'gaussian':
-                samples = np.random.randn(2048*64*4*64, 3).astype(np.float32)
+                samples = np.random.randn(2048 * 64 * 4 * 64, 3).astype(np.float32)
             else:
                 raise NotImplementedError
 
+        # Load noise mesh if provided
         if data_loader['noise_mesh'] is not None:
-            noise, _ = trimesh.sample.sample_surface(trimesh.load(data_loader['noise_mesh']),  2048*64*4*64)
+            noise, _ = trimesh.sample.sample_surface(trimesh.load(data_loader['noise_mesh']), 2048 * 64 * 4 * 64)
         else:
             noise = None
 
-        samples = samples.astype(np.float32)# - 0.12
+        # Convert samples to float32
+        samples = samples.astype(np.float32)
         data_loader = range(data_loader['epoch_size'])
 
+    # Training loop
     for data_iter_step, batch in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
 
-        # we use a per iteration (instead of per epoch) lr scheduler
+        # Adjust learning rate per iteration
         if data_iter_step % accum_iter == 0:
             lr_sched.adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch, args)
 
+        # Prepare input data
         if isinstance(batch, int):
             ind = np.random.default_rng().choice(samples.shape[0], batch_size, replace=True)
             xyz = samples[ind]
@@ -247,6 +260,7 @@ def train_one_epoch(model: torch.nn.Module,
         else:
             xyz = batch.to(device, non_blocking=True)
 
+        # Forward pass and loss computation
         with torch.cuda.amp.autocast(enabled=False):
             if noise is not None:
                 ind = np.random.default_rng().choice(noise.shape[0], batch_size, replace=True)
@@ -254,14 +268,46 @@ def train_one_epoch(model: torch.nn.Module,
                 init_noise = torch.from_numpy(init_noise).float().to(device, non_blocking=True)
             else:
                 init_noise = None
-            loss = criterion(model, xyz, init_noise=init_noise)
+
+            # Sample noise  ---> noysis step
+            rnd_normal = torch.randn([xyz.shape[0],], device=xyz.device)
+
+            sigma = (rnd_normal * 1.2 -1).exp()
+            weight = (sigma ** 2 + 1) / (sigma) ** 2
+            y = xyz
+
+            #chose the kind of noise
+            if args.target == 'Gaussian':
+                n = torch.randn_like(y[:, :3]) * sigma[:, None]
+                if y.shape[1] != 3:
+                    c = (torch.rand_like(y[:, 3:]) - 0.5) / np.sqrt(1/12) * sigma[:, None]
+                    n = torch.cat([n, c], dim=1)
+            elif args.target == 'Uniform':
+                n = (torch.rand_like(y) - 0.5) / np.sqrt(1/12) * sigma[:, None]
+            elif args.target == 'Sphere':
+                n = torch.randn_like(y[:, :3])
+                n = torch.nn.functional.normalize(n, dim=1)
+                n /= np.sqrt(1/3)
+                n = n * sigma[:, None]
+
+            elif args.target == "Mesh":
+                assert init_noise is not None
+                n = init_noise * sigma[:, None]
+            else:
+                raise NotImplementedError
+            
+            D_yn = model(y + n, sigma)
+
+            loss = ( weight[:, None] * ((D_yn - y) ** 2) ).mean()
             
         loss_value = loss.item()
 
+        # Handle invalid loss values
         if not math.isfinite(loss_value):
-            print("Loss is {}, stopping training".format(loss_value))
+            print(f"Loss is {loss_value}, stopping training")
             sys.exit(1)
 
+        # Backward pass and gradient update
         loss /= accum_iter
         loss_scaler(loss, optimizer, clip_grad=max_norm,
                     parameters=model.parameters(), create_graph=False,
@@ -271,8 +317,10 @@ def train_one_epoch(model: torch.nn.Module,
 
         torch.cuda.synchronize()
 
+        # Update metrics
         metric_logger.update(loss=loss_value)
 
+        # Track learning rate
         min_lr = 10.
         max_lr = 0.
         for group in optimizer.param_groups:
@@ -281,26 +329,24 @@ def train_one_epoch(model: torch.nn.Module,
 
         metric_logger.update(lr=max_lr)
 
+        # Log metrics to TensorBoard
         loss_value_reduce = misc.all_reduce_mean(loss_value)
         if log_writer is not None and (data_iter_step + 1) % accum_iter == 0:
-            """ We use epoch_1000x as the x-axis in tensorboard.
-            This calibrates different curves when batch size changes.
-            """
             epoch_1000x = int((data_iter_step / len(data_loader) + epoch) * 1000)
             log_writer.add_scalar('loss', loss_value_reduce, epoch_1000x)
             log_writer.add_scalar('lr', max_lr, epoch_1000x)
 
-    # gather the stats from all processes
+    # Synchronize metrics across processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
+    # Return averaged metrics
+    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 def train(args, device):
     """Main training loop."""
     data_loader_train = setup_data_loader(args)
     model, optimizer, loss_scaler = initialize_model_and_optimizer(args, device)
-    criterion = EDMLoss(dist=args.target)
 
     misc.load_model(args=args, model_without_ddp=model, optimizer=optimizer, loss_scaler=loss_scaler)
 
@@ -309,7 +355,7 @@ def train(args, device):
 
     for epoch in range(args.start_epoch, args.epochs):
         train_stats = train_one_epoch(
-            model, data_loader_train, optimizer, criterion, device, epoch, loss_scaler,
+            model, data_loader_train, optimizer, device, epoch, loss_scaler,
             args.clip_grad, log_writer=None, args=args
         )
         if args.output_dir and (epoch % 5 == 0 or epoch + 1 == args.epochs):

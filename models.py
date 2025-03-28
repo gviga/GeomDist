@@ -6,7 +6,6 @@ import math
 import numpy as np
 
 import torch.nn.functional
-import trimesh
 
 
 def modulate(x, shift, scale):
@@ -379,42 +378,3 @@ def inverse_edm_sampler(
         # outputs.append((x_next / (1+t_next**2).sqrt()).detach().cpu().numpy())
     x_next = x_next / (1+t_next**2).sqrt()
     return x_next, outputs
-
-class EDMLoss:
-    def __init__(self, P_mean=-1.2, P_std=1.2, sigma_data=1, dist='Gaussian'):
-        self.P_mean = P_mean
-        self.P_std = P_std
-        self.sigma_data = sigma_data
-
-        self.dist = dist
-
-    def __call__(self, net, inputs, labels=None, augment_pipe=None, init_noise=None):
-        rnd_normal = torch.randn([inputs.shape[0],], device=inputs.device)
-
-        sigma = (rnd_normal * self.P_std + self.P_mean).exp()
-        weight = (sigma ** 2 + self.sigma_data ** 2) / (sigma * self.sigma_data) ** 2
-        y, augment_labels = augment_pipe(inputs) if augment_pipe is not None else (inputs, None)
-
-        if self.dist == 'Gaussian':
-            n = torch.randn_like(y[:, :3]) * sigma[:, None]
-            if y.shape[1] != 3:
-                c = (torch.rand_like(y[:, 3:]) - 0.5) / np.sqrt(1/12) * sigma[:, None]
-                n = torch.cat([n, c], dim=1)
-        elif self.dist == 'Uniform':
-            n = (torch.rand_like(y) - 0.5) / np.sqrt(1/12) * sigma[:, None]
-        elif self.dist == 'Sphere':
-            n = torch.randn_like(y[:, :3])
-            n = torch.nn.functional.normalize(n, dim=1)
-            n /= np.sqrt(1/3)
-            n = n * sigma[:, None]
-
-        elif self.dist == "Mesh":
-            assert init_noise is not None
-            n = init_noise * sigma[:, None]
-        else:
-            raise NotImplementedError
-
-        D_yn = net(y + n, sigma)
-
-        loss = weight[:, None] * ((D_yn - y) ** 2)
-        return loss.mean()
