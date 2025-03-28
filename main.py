@@ -17,7 +17,7 @@ import models
 from models import EDMLoss
 from engine import train_one_epoch
 
-
+from utils import *
 
 def get_inline_arg():
     parser = argparse.ArgumentParser('Train', add_help=False)
@@ -100,29 +100,6 @@ def get_inline_arg():
 # Constants
 NEURAL_RENDERING_RESOLUTION = 128
 
-def setup_logging(output_dir: str):
-    """Set up logging."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(levelname)s - %(message)s",
-        handlers=[
-            logging.StreamHandler(),
-            logging.FileHandler(os.path.join(output_dir, "training.log"), mode="w", encoding="utf-8")
-        ]
-    )
-def initialize_device_and_seed(args):
-    """Initialize device and set random seeds."""
-    misc.init_distributed_mode(args)
-    device = torch.device(args.device)
-    seed = args.seed + misc.get_rank()
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    cudnn.benchmark = True
-    cudnn.deterministic = True
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-    return device
-
 def setup_data_loader(args):
     """Set up the data loader based on the input data path."""
     if args.data_path.endswith(('.obj', '.ply')):
@@ -145,6 +122,8 @@ def setup_data_loader(args):
     else:
         raise NotImplementedError(f"Unsupported data path: {args.data_path}")
     return data_loader_train
+
+
 
 def initialize_model_and_optimizer(args):
     device = torch.device(args.device)
