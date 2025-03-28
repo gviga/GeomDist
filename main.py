@@ -163,7 +163,6 @@ def initialize_model_and_optimizer(args,device):
 
 def train_one_epoch(model: torch.nn.Module,
                     data_loader, optimizer: torch.optim.Optimizer,
-                    criterion,
                     device: torch.device, epoch: int, loss_scaler, max_norm: float = 0,
                     log_writer=None, args=None):
     # Set the model to training mode
@@ -213,6 +212,8 @@ def train_one_epoch(model: torch.nn.Module,
                 else:
                     # Sample points from the mesh without texture
                     samples, _ = trimesh.sample.sample_surface(mesh, 2048 * 64 * 4 * 64)
+                    #samples = mesh.vertices
+
             else:
                 samples = mesh.vertices
         # Generate primitive shapes if no object file is provided
@@ -261,7 +262,7 @@ def train_one_epoch(model: torch.nn.Module,
             xyz = batch.to(device, non_blocking=True)
 
         # Forward pass and loss computation
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast('cuda',enabled=False):
             if noise is not None:
                 ind = np.random.default_rng().choice(noise.shape[0], batch_size, replace=True)
                 init_noise = noise[ind]
