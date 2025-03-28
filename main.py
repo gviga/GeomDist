@@ -36,9 +36,9 @@ def get_inline_arg():
     parser.add_argument('--epochs', default=1000, type=int)
     parser.add_argument('--accum_iter', default=1, type=int,
                         help='Accumulate gradient iterations (for increasing the effective batch size under memory constraints)')
-    
+    parser.add_argument('--num-steps', default=64, type=int)
 
-    # Model parameters
+    parser.add_argument('--config', default='config.json', type=str, help='Path to the config file')    # Model parameters
     parser.add_argument('--model', default='EDMPrecond', type=str, metavar='MODEL',
                         help='Name of model to train')
     parser.add_argument('--depth', default=6, type=int, metavar='MODEL')
@@ -61,11 +61,15 @@ def get_inline_arg():
 
     parser.add_argument('--warmup_epochs', type=int, default=1, metavar='N',
                         help='epochs to warmup LR')
+    parser.add_argument("--train", action="store_true", help="Train a <run_name> model")
+    parser.add_argument("--inference", action="store_true", help="Perform inference on the <run_name> model")
+    parser.add_argument('--N', default=1000000, type=int)
 
     # Dataset parameters
     parser.add_argument('--target', default='Gaussian', type=str, )
     parser.add_argument('--data_path', default='shapes/Jellyfish_lamp_part_A__B_normalized.obj', type=str,
                         help='dataset path')
+    parser.add_argument('--intermediate', action='store_true')
 
     parser.add_argument('--texture_path', default=None, type=str,
                         help='dataset path')
@@ -102,6 +106,7 @@ def get_inline_arg():
     parser.add_argument('--dist_on_itp', action='store_true')
     parser.add_argument('--dist_url', default='env://',
                         help='url used to set up distributed training')
+
     args = parser.parse_args()
 
     return args
@@ -112,15 +117,7 @@ NEURAL_RENDERING_RESOLUTION = 128
 
 def setup_data_loader(args):
     """Set up the data loader based on the input data path."""
-    if args.data_path.endswith(('.obj', '.ply')):
-        data_loader_train = {
-            'obj_file': args.data_path,
-            'batch_size': args.batch_size,
-            'epoch_size': 512,
-            'texture_path': args.texture_path,
-            'noise_mesh': args.noise_mesh or None
-        }
-    elif any(primitive in args.data_path for primitive in ['sphere', 'plane', 'volume']):
+    if any(primitive in args.data_path for primitive in ['sphere', 'plane', 'volume']):
         data_loader_train = {
             'obj_file': None,
             'primitive': args.data_path,
@@ -130,7 +127,13 @@ def setup_data_loader(args):
             'noise_mesh': args.noise_mesh or None
         }
     else:
-        raise NotImplementedError(f"Unsupported data path: {args.data_path}")
+        data_loader_train = {
+            'obj_file': args.data_path,
+            'batch_size': args.batch_size,
+            'epoch_size': 5,
+            'texture_path': args.texture_path,
+            'noise_mesh': args.noise_mesh or None
+        }
     return data_loader_train
 
 
@@ -360,8 +363,11 @@ def train(args, device):
             args.clip_grad, log_writer=None, args=args
         )
         if args.output_dir and (epoch % 5 == 0 or epoch + 1 == args.epochs):
-            misc.save_model(args=args, model=model, model_without_ddp=model, optimizer=optimizer, loss_scaler=loss_scaler, epoch=epoch)
-
+            if args.distributed:
+                misc.save_model(args=args,model=model, model_without_ddp=model.module,optimizer=optimizer, loss_scaler=loss_scaler, epoch=epoch)
+            else:
+                misc.save_model(args=args, model=model,model_without_ddp=model, optimizer=optimizer, loss_scaler=loss_scaler, epoch=epoch)
+                
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()}, 'epoch': epoch}
         if args.output_dir and misc.is_main_process():
             with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
@@ -371,7 +377,55 @@ def train(args, device):
     logging.info(f"Training completed in {str(datetime.timedelta(seconds=int(total_time)))}")
 
 
+def inference(args, device):
 
+    model = models.__dict__[args.model](channels=3 if args.texture_path is None else 6, depth=args.depth)
+    model.to(device)
+    model.load_state_dict(torch.load(args.output_dir + '/checkpoint-'+str(args.epochs-1)+'.pth', map_location=device,weights_only=False)['model'], strict=True)
+    
+    #misc.load_model(args, model, optimizer, loss_scaler)
+    if args.target == 'Gaussian':
+        noise = torch.randn(args.N, 3).cuda()
+    elif args.target == 'Uniform':
+        noise = (torch.rand(args.N, 3).cuda() - 0.5) / np.sqrt(1/12)
+    elif args.target == 'Sphere':
+        n = torch.randn(args.N, 3).cuda()
+        n = torch.nn.functional.normalize(n, dim=1)
+        noise = n / np.sqrt(1/3)
+    elif args.target == 'Mesh':
+        assert args.noise_mesh is not None
+        noise, _ = trimesh.sample.sample_surface(trimesh.load(args.noise_mesh), args.N)
+        noise = torch.from_numpy(noise).float().cuda()
+    else:
+        raise NotImplementedError
+
+    if args.texture_path is not None:
+        color = (torch.rand(args.N, 3).cuda() - 0.5) / np.sqrt(1/12)
+        noise = torch.cat([noise, color], dim=1)
+
+    sample, intermediate_steps = model.sample(batch_seeds=noise, num_steps=args.num_steps)
+
+    if args.texture_path is not None:
+        sample = sample.detach().cpu().numpy()
+        vertices, colors = sample[:, :3], sample[:, 3:]
+        colors = (colors * np.sqrt(1/12) + 0.5) * 255.0
+        colors = np.concatenate([colors, np.ones_like(colors[:, 0:1]) * 255.0], axis=1).astype(np.uint8) # alpha channel
+        trimesh.PointCloud(vertices, colors).export(os.path.join(args.output_dir, 'sample.ply'))
+
+        if args.intermediate:
+            for i, s in enumerate(intermediate_steps):
+                vertices, colors = s[:, :3], s[:, 3:]
+                colors = (colors * np.sqrt(1/12) + 0.5) * 255.0
+                colors = np.concatenate([colors, np.ones_like(colors[:, 0:1]) * 255.0], axis=1).astype(np.uint8) # alpha channel
+
+                trimesh.PointCloud(vertices, colors).export(os.path.join(args.output_dir, 'sample-{:03d}.ply'.format(i)))
+
+    else:
+        trimesh.PointCloud(sample.detach().cpu().numpy()).export(os.path.join(args.output_dir, 'sample.ply'))
+
+        if args.intermediate:
+            for i, s in enumerate(intermediate_steps):
+                trimesh.PointCloud(s).export(os.path.join(args.output_dir, 'sample-{:03d}.ply'.format(i)))
 
 def main():
     args = get_inline_arg()
@@ -379,7 +433,13 @@ def main():
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
         setup_logging(args.output_dir)
     device = initialize_device_and_seed(args)
-    train(args, device)
+    
+    if args.train:
+        train(args, device)
+
+    if args.inference:
+        inference(args, device)
+
 
 if __name__ == '__main__':
     main()
