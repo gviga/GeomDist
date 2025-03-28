@@ -48,10 +48,10 @@ def get_inline_arg():
     parser.add_argument('--accum_iter', default=1, type=int,
                         help='Accumulate gradient iterations (for increasing the effective batch size under memory constraints)')
     parser.add_argument('--num-steps', default=64, type=int)
-
     parser.add_argument('--model', default='EDMPrecond', type=str, metavar='MODEL',
                         help='Name of model to train')
     parser.add_argument('--depth', default=6, type=int, metavar='MODEL')
+    
 
 
     # Optimizer parameters
@@ -430,6 +430,8 @@ def inference(args, device):
         if args.intermediate:
             for i, s in enumerate(intermediate_steps):
                 trimesh.PointCloud(s).export(os.path.join(args.output_dir, 'sample-{:03d}.ply'.format(i)))
+
+
 
 def main():
     args = get_inline_arg()
