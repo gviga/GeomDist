@@ -143,19 +143,17 @@ def setup_data_loader(args):
 
 
 def initialize_model_and_optimizer(args,device):
+    """Initialize the model, optimizer, and loss scaler."""
+    
+    # Initialize the model
     model = models.__dict__[args.model](channels=3 if args.texture_path is None else 6, depth=args.depth)
     model.to(device)
     
     
-    """Initialize the model, optimizer, and loss scaler."""
+    # Initialize the optimizer and loss scaler (If distributed training different behaviour)
     eff_batch_size = args.batch_size * args.accum_iter * misc.get_world_size()
     if args.learning_rate is None:  # only base_lr is specified
         args.learning_rate = args.blr * eff_batch_size / 128
-    print("base lr: %.2e" % (args.learning_rate * 128 / eff_batch_size))
-    print("actual lr: %.2e" % args.learning_rate)
-
-    print("accumulate grad iterations: %d" % args.accum_iter)
-    print("effective batch size: %d" % eff_batch_size)
     
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=False)
@@ -165,6 +163,14 @@ def initialize_model_and_optimizer(args,device):
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
     
     loss_scaler = NativeScaler()
+    
+    
+    # Log
+    print("base lr: %.2e" % (args.learning_rate * 128 / eff_batch_size))
+    print("actual lr: %.2e" % args.learning_rate)
+    print("accumulate grad iterations: %d" % args.accum_iter)
+    print("effective batch size: %d" % eff_batch_size)
+
     return model, optimizer, loss_scaler
 
 
@@ -172,7 +178,7 @@ def train_one_epoch(model: torch.nn.Module,
                     data_loader, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, loss_scaler, max_norm: float = 0,
                     log_writer=None, args=None):
-    # Set the model to training mode
+
     model.train(True)
 
     # Initialize metric logger
@@ -185,16 +191,14 @@ def train_one_epoch(model: torch.nn.Module,
     accum_iter = args.accum_iter
     optimizer.zero_grad()
 
-    # Log directory if log_writer is provided
+    # Log
     if log_writer is not None:
         print(f'log_dir: {log_writer.log_dir}')
-    
     print(data_loader)
 
-    # Initialize noise and samples
-    noise = None
+    noise = None   
 
-    # Handle data loader setup
+    # Load Mesh and sample points (---> this can be done in the dataloader)
     if isinstance(data_loader, dict):
         obj_file = data_loader['obj_file']
         batch_size = data_loader['batch_size']
@@ -249,7 +253,6 @@ def train_one_epoch(model: torch.nn.Module,
         else:
             noise = None
 
-        # Convert samples to float32
         samples = samples.astype(np.float32)
         data_loader = range(data_loader['epoch_size'])
 
@@ -284,7 +287,7 @@ def train_one_epoch(model: torch.nn.Module,
             weight = (sigma ** 2 + 1) / (sigma) ** 2
             y = xyz
 
-            #chose the kind of noise
+            #chose the kind of noise   (Can we do so in a more compact way?)
             if args.target == 'Gaussian':
                 n = torch.randn_like(y[:, :3]) * sigma[:, None]
                 if y.shape[1] != 3:
@@ -353,25 +356,30 @@ def train_one_epoch(model: torch.nn.Module,
 
 def train(args, device):
     """Main training loop."""
+    
+    # Set up the data loader
     data_loader_train = setup_data_loader(args)
+    # Initialize the model, optimizer, and loss scaler
     model, optimizer, loss_scaler = initialize_model_and_optimizer(args, device)
-
     misc.load_model(args=args, model_without_ddp=model, optimizer=optimizer, loss_scaler=loss_scaler)
 
     logging.info(f"Start training for {args.epochs} epochs")
+    
     start_time = time.time()
-
     for epoch in range(args.start_epoch, args.epochs):
+        # Train for one epoch
         train_stats = train_one_epoch(
             model, data_loader_train, optimizer, device, epoch, loss_scaler,
             args.clip_grad, log_writer=None, args=args
         )
+        # Save chackpoints
         if args.output_dir and (epoch % 5 == 0 or epoch + 1 == args.epochs):
             if args.distributed:
                 misc.save_model(args=args,model=model, model_without_ddp=model.module,optimizer=optimizer, loss_scaler=loss_scaler, epoch=epoch)
             else:
                 misc.save_model(args=args, model=model,model_without_ddp=model, optimizer=optimizer, loss_scaler=loss_scaler, epoch=epoch)
                 
+        #Log stats
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()}, 'epoch': epoch}
         if args.output_dir and misc.is_main_process():
             with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
@@ -383,11 +391,12 @@ def train(args, device):
 
 def inference(args, device):
 
+    #Load Final Model
     model = models.__dict__[args.model](channels=3 if args.texture_path is None else 6, depth=args.depth)
     model.to(device)
     model.load_state_dict(torch.load(args.output_dir + '/checkpoint-'+str(args.epochs-1)+'.pth', map_location=device,weights_only=False)['model'], strict=True)
     
-    #misc.load_model(args, model, optimizer, loss_scaler)
+    #Sample X_0
     if args.target == 'Gaussian':
         noise = torch.randn(args.num_points_inference, 3).cuda()
     elif args.target == 'Uniform':
@@ -403,12 +412,15 @@ def inference(args, device):
     else:
         raise NotImplementedError
 
+    #Read Texture if needed
     if args.texture_path is not None:
         color = (torch.rand(args.num_points_inference, 3).cuda() - 0.5) / np.sqrt(1/12)
         noise = torch.cat([noise, color], dim=1)
 
+    #Inference
     sample, intermediate_steps = model.sample(batch_seeds=noise, num_steps=args.num_steps)
 
+    #Save Results
     if args.texture_path is not None:
         sample = sample.detach().cpu().numpy()
         vertices, colors = sample[:, :3], sample[:, 3:]
@@ -423,7 +435,6 @@ def inference(args, device):
                 colors = np.concatenate([colors, np.ones_like(colors[:, 0:1]) * 255.0], axis=1).astype(np.uint8) # alpha channel
 
                 trimesh.PointCloud(vertices, colors).export(os.path.join(args.output_dir, 'sample-{:03d}.ply'.format(i)))
-
     else:
         trimesh.PointCloud(sample.detach().cpu().numpy()).export(os.path.join(args.output_dir, 'sample.ply'))
 
