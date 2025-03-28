@@ -1,6 +1,6 @@
 # Geometry Distributions
 
-This repository is a refractory of the code of GeometryDistributions https://1zb.github.io/GeomDist/. Credit to Biao Zangh for the original code and the wonderful work.
+This repoitory is a refractory of the code of GeometryDistributions https://1zb.github.io/GeomDist/. Credit to Biao Zangh for the original code and the wonderful work.
 
 ### :bullettrain_front: Training 
 
