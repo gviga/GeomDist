@@ -31,17 +31,28 @@ from PIL import Image
 
 def get_inline_arg():
     parser = argparse.ArgumentParser('Train', add_help=False)
+    # common parameters
+    parser.add_argument('--config', default='config.json', type=str, help='Path to the config file')    # Model parameters
+    parser.add_argument("--train", action="store_true", help="Train a <run_name> model")
+    parser.add_argument("--inference", action="store_true", help="Perform inference on the <run_name> model")
+    parser.add_argument('--device', default='cuda',
+                        help='device to use for training / testing')
+    parser.add_argument('--seed', default=21, type=int)
+    parser.add_argument('--epochs', default=1000, type=int)
+    parser.add_argument('--learning_rate', type=float, default=None, metavar='LR',
+                        help='learning rate (absolute lr)')
     parser.add_argument('--batch_size', default=1024*64*2, type=int,
                         help='Batch size per GPU (effective batch size is batch_size * accum_iter * # gpus')
-    parser.add_argument('--epochs', default=1000, type=int)
+    #parser.add_argument('--num_points_train', default=10000, type=int, help='Number of points for training the vector field')
+    parser.add_argument('--num_points_inference', default=10000, type=int, help='Number of points for inference')
     parser.add_argument('--accum_iter', default=1, type=int,
                         help='Accumulate gradient iterations (for increasing the effective batch size under memory constraints)')
     parser.add_argument('--num-steps', default=64, type=int)
 
-    parser.add_argument('--config', default='config.json', type=str, help='Path to the config file')    # Model parameters
     parser.add_argument('--model', default='EDMPrecond', type=str, metavar='MODEL',
                         help='Name of model to train')
     parser.add_argument('--depth', default=6, type=int, metavar='MODEL')
+
 
     # Optimizer parameters
     parser.add_argument('--clip_grad', type=float, default=None, metavar='NORM',
@@ -49,8 +60,6 @@ def get_inline_arg():
     parser.add_argument('--weight_decay', type=float, default=0.05,
                         help='weight decay (default: 0.05)')
 
-    parser.add_argument('--lr', type=float, default=None, metavar='LR',
-                        help='learning rate (absolute lr)')
     parser.add_argument('--blr', type=float, default=5e-7, metavar='LR',
                         help='base learning rate: absolute_lr = base_lr * total_batch_size / 256')
     parser.add_argument('--layer_decay', type=float, default=0.75,
@@ -61,9 +70,6 @@ def get_inline_arg():
 
     parser.add_argument('--warmup_epochs', type=int, default=1, metavar='N',
                         help='epochs to warmup LR')
-    parser.add_argument("--train", action="store_true", help="Train a <run_name> model")
-    parser.add_argument("--inference", action="store_true", help="Perform inference on the <run_name> model")
-    parser.add_argument('--N', default=1000000, type=int)
 
     # Dataset parameters
     parser.add_argument('--target', default='Gaussian', type=str, )
@@ -81,9 +87,6 @@ def get_inline_arg():
                         help='path where to save, empty for no saving')
     parser.add_argument('--log_dir', default='./output/',
                         help='path where to tensorboard log')
-    parser.add_argument('--device', default='cuda',
-                        help='device to use for training / testing')
-    parser.add_argument('--seed', default=0, type=int)
     parser.add_argument('--resume', default='',
                         help='resume from checkpoint')
 
@@ -98,6 +101,7 @@ def get_inline_arg():
                         help='Pin CPU memory in DataLoader for more efficient (sometimes) transfer to GPU.')
     parser.add_argument('--no_pin_mem', action='store_false', dest='pin_mem')
     parser.set_defaults(pin_mem=True)
+
 
     # distributed training parameters
     parser.add_argument('--world_size', default=1, type=int,
@@ -145,10 +149,10 @@ def initialize_model_and_optimizer(args,device):
     
     """Initialize the model, optimizer, and loss scaler."""
     eff_batch_size = args.batch_size * args.accum_iter * misc.get_world_size()
-    if args.lr is None:  # only base_lr is specified
-        args.lr = args.blr * eff_batch_size / 128
-    print("base lr: %.2e" % (args.lr * 128 / eff_batch_size))
-    print("actual lr: %.2e" % args.lr)
+    if args.learning_rate is None:  # only base_lr is specified
+        args.learning_rate = args.blr * eff_batch_size / 128
+    print("base lr: %.2e" % (args.learning_rate * 128 / eff_batch_size))
+    print("actual lr: %.2e" % args.learning_rate)
 
     print("accumulate grad iterations: %d" % args.accum_iter)
     print("effective batch size: %d" % eff_batch_size)
@@ -156,9 +160,9 @@ def initialize_model_and_optimizer(args,device):
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=False)
         model_without_ddp =model.module
-        optimizer = torch.optim.AdamW(model_without_ddp.parameters(), lr=args.lr)
+        optimizer = torch.optim.AdamW(model_without_ddp.parameters(), lr=args.learning_rate)
     else:
-        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
     
     loss_scaler = NativeScaler()
     return model, optimizer, loss_scaler
@@ -385,22 +389,22 @@ def inference(args, device):
     
     #misc.load_model(args, model, optimizer, loss_scaler)
     if args.target == 'Gaussian':
-        noise = torch.randn(args.N, 3).cuda()
+        noise = torch.randn(args.num_points_inference, 3).cuda()
     elif args.target == 'Uniform':
-        noise = (torch.rand(args.N, 3).cuda() - 0.5) / np.sqrt(1/12)
+        noise = (torch.rand(args.num_points_inference, 3).cuda() - 0.5) / np.sqrt(1/12)
     elif args.target == 'Sphere':
-        n = torch.randn(args.N, 3).cuda()
+        n = torch.randn(args.num_points_inference, 3).cuda()
         n = torch.nn.functional.normalize(n, dim=1)
         noise = n / np.sqrt(1/3)
     elif args.target == 'Mesh':
         assert args.noise_mesh is not None
-        noise, _ = trimesh.sample.sample_surface(trimesh.load(args.noise_mesh), args.N)
+        noise, _ = trimesh.sample.sample_surface(trimesh.load(args.noise_mesh), args.num_points_inference)
         noise = torch.from_numpy(noise).float().cuda()
     else:
         raise NotImplementedError
 
     if args.texture_path is not None:
-        color = (torch.rand(args.N, 3).cuda() - 0.5) / np.sqrt(1/12)
+        color = (torch.rand(args.num_points_inference, 3).cuda() - 0.5) / np.sqrt(1/12)
         noise = torch.cat([noise, color], dim=1)
 
     sample, intermediate_steps = model.sample(batch_seeds=noise, num_steps=args.num_steps)
