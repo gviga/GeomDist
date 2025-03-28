@@ -5,27 +5,23 @@ import numpy as np
 import os
 import time
 from pathlib import Path
+import logging
 
 import torch
 import torch.backends.cudnn as cudnn
 from torch.utils.tensorboard import SummaryWriter
 
-torch.set_num_threads(8)
-import util.lr_decay as lrd
-import util.misc as misc
+from util import lr_decay as lrd, misc
 from util.misc import NativeScalerWithGradNormCount as NativeScaler
-
-import models as models
+import models
 from models import EDMLoss
-
 from engine import train_one_epoch
 
-from points import Points
 
 
-def get_args_parser():
+def get_inline_arg():
     parser = argparse.ArgumentParser('Train', add_help=False)
-    parser.add_argument('--batch_size', default=2048*64*2, type=int,
+    parser.add_argument('--batch_size', default=1024*64*2, type=int,
                         help='Batch size per GPU (effective batch size is batch_size * accum_iter * # gpus')
     parser.add_argument('--epochs', default=1000, type=int)
     parser.add_argument('--accum_iter', default=1, type=int,
@@ -96,151 +92,124 @@ def get_args_parser():
     parser.add_argument('--dist_on_itp', action='store_true')
     parser.add_argument('--dist_url', default='env://',
                         help='url used to set up distributed training')
+    args = parser.parse_args()
 
-    return parser
+    return args
 
-def main(args):
 
-    # os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+# Constants
+NEURAL_RENDERING_RESOLUTION = 128
 
+def setup_logging(output_dir: str):
+    """Set up logging."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler(os.path.join(output_dir, "training.log"), mode="w", encoding="utf-8")
+        ]
+    )
+def initialize_device_and_seed(args):
+    """Initialize device and set random seeds."""
     misc.init_distributed_mode(args)
-
-    print('job dir: {}'.format(os.path.dirname(os.path.realpath(__file__))))
-    print("{}".format(args).replace(', ', ',\n'))
-
     device = torch.device(args.device)
-
-    # fix the seed for reproducibility
     seed = args.seed + misc.get_rank()
     torch.manual_seed(seed)
     np.random.seed(seed)
-
     cudnn.benchmark = True
-    cudnn.deterministic=True
-
-    # The flag below controls whether to allow TF32 on matmul. This flag defaults to False
-    # in PyTorch 1.12 and later.
+    cudnn.deterministic = True
     torch.backends.cuda.matmul.allow_tf32 = True
-
-    # The flag below controls whether to allow TF32 on cuDNN. This flag defaults to True.
     torch.backends.cudnn.allow_tf32 = True
+    return device
 
-    if True:
-        num_tasks = misc.get_world_size()
-        global_rank = misc.get_rank()
-
-
-    neural_rendering_resolution = 128
-    if args.data_path.endswith('.obj') or args.data_path.endswith('.ply'):
+def setup_data_loader(args):
+    """Set up the data loader based on the input data path."""
+    if args.data_path.endswith(('.obj', '.ply')):
         data_loader_train = {
             'obj_file': args.data_path,
             'batch_size': args.batch_size,
             'epoch_size': 512,
             'texture_path': args.texture_path,
+            'noise_mesh': args.noise_mesh or None
         }
-        if args.noise_mesh is not None:
-            data_loader_train['noise_mesh'] = args.noise_mesh
-        else:
-            data_loader_train['noise_mesh'] = None
-    elif 'sphere' in args.data_path or 'plane' in args.data_path or 'volume' in args.data_path:
+    elif any(primitive in args.data_path for primitive in ['sphere', 'plane', 'volume']):
         data_loader_train = {
             'obj_file': None,
             'primitive': args.data_path,
             'batch_size': args.batch_size,
             'epoch_size': 512,
             'texture_path': args.texture_path,
+            'noise_mesh': args.noise_mesh or None
         }
-        if args.noise_mesh is not None:
-            data_loader_train['noise_mesh'] = args.noise_mesh
-        else:
-            data_loader_train['noise_mesh'] = None
     else:
-        raise NotImplementedError
-    print(data_loader_train)
+        raise NotImplementedError(f"Unsupported data path: {args.data_path}")
+    return data_loader_train
 
-    if global_rank == 0 and args.log_dir is not None and not args.eval:
-        os.makedirs(args.log_dir, exist_ok=True)
-        log_writer = SummaryWriter(log_dir=args.log_dir)
-    else:
-        log_writer = None
-
-
-    criterion = EDMLoss(dist=args.target)
-    
+def initialize_model_and_optimizer(args):
+    device = torch.device(args.device)
     model = models.__dict__[args.model](channels=3 if args.texture_path is None else 6, depth=args.depth)
     model.to(device)
-
-    model_without_ddp = model
-    n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-    print("Model = %s" % str(model_without_ddp))
-    print('number of params (M): %.2f' % (n_parameters / 1.e6))
-
-    eff_batch_size = args.batch_size * args.accum_iter * misc.get_world_size()
     
+    
+    """Initialize the model, optimizer, and loss scaler."""
+    eff_batch_size = args.batch_size * args.accum_iter * misc.get_world_size()
     if args.lr is None:  # only base_lr is specified
         args.lr = args.blr * eff_batch_size / 128
-
     print("base lr: %.2e" % (args.lr * 128 / eff_batch_size))
     print("actual lr: %.2e" % args.lr)
 
     print("accumulate grad iterations: %d" % args.accum_iter)
     print("effective batch size: %d" % eff_batch_size)
-
+    
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=False)
-        model_without_ddp = model.module
-
-    optimizer = torch.optim.AdamW(model_without_ddp.parameters(), lr=args.lr)
+        model_without_ddp =model.module
+        optimizer = torch.optim.AdamW(model_without_ddp.parameters(), lr=args.lr)
+    else:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    
     loss_scaler = NativeScaler()
+    return model, optimizer, loss_scaler
 
-    misc.load_model(args=args, model_without_ddp=model_without_ddp, optimizer=optimizer, loss_scaler=loss_scaler)
 
-    print(f"Start training for {args.epochs} epochs")
+def train(args, device):
+    """Main training loop."""
+    data_loader_train = setup_data_loader(args)
+    model, optimizer, loss_scaler = initialize_model_and_optimizer(args, device)
+    criterion = EDMLoss(dist=args.target)
+
+    misc.load_model(args=args, model_without_ddp=model, optimizer=optimizer, loss_scaler=loss_scaler)
+
+    logging.info(f"Start training for {args.epochs} epochs")
     start_time = time.time()
-    max_iou = 0.0
-    for epoch in range(args.start_epoch, args.epochs):
-        # if args.distributed and args.data_path.endswith('.ply'):
-        #     data_loader_train.sampler.set_epoch(epoch)
 
+    for epoch in range(args.start_epoch, args.epochs):
         train_stats = train_one_epoch(
-            model, data_loader_train,
-            optimizer, criterion, device, epoch, loss_scaler,
-            args.clip_grad,
-            log_writer=log_writer,
-            args=args
+            model, data_loader_train, optimizer, criterion, device, epoch, loss_scaler,
+            args.clip_grad, log_writer=None, args=args
         )
         if args.output_dir and (epoch % 5 == 0 or epoch + 1 == args.epochs):
-            misc.save_model(
-                args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
-                loss_scaler=loss_scaler, epoch=epoch)
+            misc.save_model(args=args, model=model, model_without_ddp=model, optimizer=optimizer, loss_scaler=loss_scaler, epoch=epoch)
 
-        if epoch % 1 == 0 or epoch + 1 == args.epochs:
-
-            log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                            # **{f'test_{k}': v for k, v in test_stats.items()},
-                            'epoch': epoch,
-                            'n_parameters': n_parameters}
-        else:
-            log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                            'epoch': epoch,
-                            'n_parameters': n_parameters}
-
+        log_stats = {**{f'train_{k}': v for k, v in train_stats.items()}, 'epoch': epoch}
         if args.output_dir and misc.is_main_process():
-            if log_writer is not None:
-                log_writer.flush()
             with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
                 f.write(json.dumps(log_stats) + "\n")
 
-
-            
     total_time = time.time() - start_time
-    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    print('Training time {}'.format(total_time_str))
+    logging.info(f"Training completed in {str(datetime.timedelta(seconds=int(total_time)))}")
 
-if __name__ == '__main__':
-    args = get_args_parser()
-    args = args.parse_args()
+
+
+
+def main():
+    args = get_inline_arg()
     if args.output_dir:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-    main(args)
+        setup_logging(args.output_dir)
+    device = initialize_device_and_seed(args)
+    train(args, device)
+
+if __name__ == '__main__':
+    main()
