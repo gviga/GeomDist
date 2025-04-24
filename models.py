@@ -107,7 +107,6 @@ def edm_sampler(
     step_indices = torch.arange(num_steps, dtype=torch.float64, device=latents.device)
     t_steps = (sigma_max ** (1 / rho) + step_indices / (num_steps - 1) * (sigma_min ** (1 / rho) - sigma_max ** (1 / rho))) ** rho
     t_steps = torch.cat([net.round_sigma(t_steps), torch.zeros_like(t_steps[:1])]) # t_N = 0
-
     # Main sampling loop.
     x_next = latents.to(torch.float64) * t_steps[0]
     outputs = []
@@ -160,8 +159,8 @@ def inverse_edm_sampler(
     outputs = None
     # outputs.append((x_next / t_steps[0]).detach().cpu().numpy())
 
-    print(t_steps[0])
-    print(x_next.mean(), x_next.std())
+    #print(t_steps[0])
+    #print(x_next.mean(), x_next.std())
     for i, (t_cur, t_next) in enumerate(zip(t_steps[:-1], t_steps[1:])): # 0, ..., N-1
         # print('steps', t_cur, t_next)
         x_cur = x_next
@@ -185,7 +184,7 @@ def inverse_edm_sampler(
             d_prime = (x_next - denoised) / t_next
             x_next = x_hat + (t_next - t_hat) * (0.5 * d_cur + 0.5 * d_prime)
 
-        print('next', (x_next / (1+t_next**2).sqrt()).mean(), (x_next / (1+t_next**2).sqrt()).std())
+        #print('next', (x_next / (1+t_next**2).sqrt()).mean(), (x_next / (1+t_next**2).sqrt()).std())
 
         # outputs.append((x_next / (1+t_next**2).sqrt()).detach().cpu().numpy())
     x_next = x_next / (1+t_next**2).sqrt()

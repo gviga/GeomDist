@@ -215,7 +215,7 @@ def normalize_mesh(mesh):
 def train_one_epoch(model: torch.nn.Module,
                     data_loader, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, loss_scaler, max_norm: float = 0,
-                    log_writer=None, args=None):
+                    log_writer=None, args=None,mesh=None):
 
     model.train(True)
 
@@ -243,7 +243,6 @@ def train_one_epoch(model: torch.nn.Module,
 
         # Load samples from an object file
         if obj_file is not None:
-            mesh = normalize_mesh(trimesh.load(obj_file))
             if len(mesh.faces)>0:
                 if data_loader['texture_path'] is not None:
                     # Load texture and apply it to the mesh
@@ -401,7 +400,7 @@ def train_one_epoch(model: torch.nn.Module,
 def train_one_epoch_FM(model: torch.nn.Module,
                     data_loader, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, loss_scaler, max_norm: float = 0,
-                    log_writer=None, args=None, path=None):
+                    log_writer=None, args=None, path=None,mesh=None):
 
     model.train(True)
 
@@ -429,11 +428,7 @@ def train_one_epoch_FM(model: torch.nn.Module,
 
         # Load samples from an object file
         if obj_file is not None:
-            mesh = normalize_mesh(trimesh.load(obj_file))
             # Normalize the mesh
-            mesh.apply_translation(-mesh.centroid)
-            scale_factor = 1.0 / max(mesh.bounding_box.extents)
-            mesh.apply_scale(scale_factor)
             if len(mesh.faces)>0:
                 if data_loader['texture_path'] is not None:
                     # Load texture and apply it to the mesh
@@ -546,29 +541,29 @@ def train(args, device):
         if args.method=='FM':
             train_stats = train_one_epoch_FM(
                 model, data_loader_train, optimizer, device, epoch, loss_scaler,
-                args.clip_grad, log_writer=None, args=args,path=path
+                args.clip_grad, log_writer=None, args=args,path=path, mesh=mesh
             )
         else:
             train_stats = train_one_epoch(
                 model, data_loader_train, optimizer, device, epoch, loss_scaler,
-                args.clip_grad, log_writer=None, args=args
+                args.clip_grad, log_writer=None, args=args,mesh=mesh
             )
 
-        # Save chackpoints
+        # Save checkpoints
         if args.output_dir and (epoch % 100 == 0 or epoch + 1 == args.epochs):
-            if args.distributed:
-                misc.save_model(args=args,model=model, model_without_ddp=model.module,optimizer=optimizer, loss_scaler=loss_scaler, epoch=epoch)
-            else:
-                misc.save_model(args=args, model=model,model_without_ddp=model, optimizer=optimizer, loss_scaler=loss_scaler, epoch=epoch)
+            if args.output_dir and (epoch % 1000 == 0 or epoch + 1 == args.epochs):
+                if args.distributed:
+                    misc.save_model(args=args,model=model, model_without_ddp=model.module,optimizer=optimizer, loss_scaler=loss_scaler, epoch=epoch)
+                else:
+                    misc.save_model(args=args, model=model,model_without_ddp=model, optimizer=optimizer, loss_scaler=loss_scaler, epoch=epoch)
 
             noise = torch.randn(args.num_points_inference, 3).to(device)
-            model2 = models.__dict__[args.model](channels=3 if args.texture_path is None else 6, depth=args.depth,network=models.__dict__[args.network]())   
-            model2.to(device)
-            model2.load_state_dict(torch.load(args.output_dir + '/checkpoint-'+str(epoch)+'.pth', map_location=device,weights_only=False)['model'], strict=True)
-            sample, solutions = model2.sample(batch_seeds=noise, num_steps=args.num_steps)
+            model.eval()
+            sample, solutions = model.sample(batch_seeds=noise, num_steps=args.num_steps)
             print(f"Chamfer distance: {chamfer_dist(sample, torch.tensor(mesh.vertices).unsqueeze(0).to(device)).item()}")
             with open(os.path.join(args.output_dir, "chamfer_distance.txt"), mode="a", encoding="utf-8") as f:
                 f.write(f"Epoch {epoch}: Chamfer distance: {chamfer_dist(sample, torch.tensor(mesh.vertices).unsqueeze(0).to(device)).item()}\n")
+
         #Log stats
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()}, 'epoch': epoch}
         
@@ -611,7 +606,7 @@ def inference(args, device):
     #Inference
     sample, solutions = model.sample(batch_seeds=noise, num_steps=args.num_steps)
     
-    start_end_subplot(sample, solutions[-1])
+    start_end_subplot(noise.cpu(), sample.cpu())
 
     # Check if the velocity field is constant along iterations
     #velocity_changes = []
