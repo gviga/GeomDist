@@ -24,8 +24,14 @@ import sys
 import util.misc as misc
 import util.lr_sched as lr_sched
 
+from flow_matching.path.scheduler import CondOTScheduler
+from flow_matching.path import AffineProbPath
+from flow_matching.solver import ODESolver
+
 
 from PIL import Image
+
+torch.cuda.set_device('cuda:1')
 
 
 
@@ -33,26 +39,29 @@ def get_inline_arg():
     parser = argparse.ArgumentParser('Train', add_help=False)
     # common parameters
     parser.add_argument('--config', default='config.json', type=str, help='Path to the config file')    # Model parameters
+    parser.add_argument('--method', default='FM', type=str, help='Method used for training')
+    parser.add_argument('--network', default='Network', type=str, help='Network used for training')
     parser.add_argument("--train", action="store_true", help="Train a <run_name> model")
     parser.add_argument("--inference", action="store_true", help="Perform inference on the <run_name> model")
-    parser.add_argument('--device', default='cuda',
+    parser.add_argument('--device', default='cuda:1',
                         help='device to use for training / testing')
     parser.add_argument('--seed', default=21, type=int)
     parser.add_argument('--epochs', default=1000, type=int)
     parser.add_argument('--learning_rate', type=float, default=None, metavar='LR',
                         help='learning rate (absolute lr)')
-    parser.add_argument('--batch_size', default=1024*64*2, type=int,
-                        help='Batch size per GPU (effective batch size is batch_size * accum_iter * # gpus')
+    parser.add_argument('--batch_size', default=1024*64*2,type=int,help='Batch size per GPU (effective batch size is batch_size * accum_iter * # gpus')
     #parser.add_argument('--num_points_train', default=10000, type=int, help='Number of points for training the vector field')
     parser.add_argument('--num_points_inference', default=10000, type=int, help='Number of points for inference')
+    parser.add_argument('--num_points_train', default=2048 * 64 * 4 * 64, type=int, help='Number of points for inference')
+
     parser.add_argument('--accum_iter', default=1, type=int,
                         help='Accumulate gradient iterations (for increasing the effective batch size under memory constraints)')
     parser.add_argument('--num-steps', default=64, type=int)
-    parser.add_argument('--model', default='EDMPrecond', type=str, metavar='MODEL',
+    parser.add_argument('--model', default='FMCond', type=str, metavar='MODEL',
                         help='Name of model to train')
     parser.add_argument('--depth', default=6, type=int, metavar='MODEL')
     
-    parser.add_argument('--target', default='shapes/Jellyfish_lamp_part_A__B_normalized.obj', type=str,
+    parser.add_argument('--data_path', default='shapes/Jellyfish_lamp_part_A__B_normalized.obj', type=str,
                         help='dataset path')
 
     parser.add_argument('--distribution', default='Gaussian', type=str, )
@@ -71,7 +80,7 @@ def get_inline_arg():
     parser.add_argument('--min_lr', type=float, default=5e-7, metavar='LR',
                         help='lower lr bound for cyclic schedulers that hit 0')
 
-    parser.add_argument('--warmup_epochs', type=int, default=1, metavar='N',
+    parser.add_argument('--warmup_epochs', type=int, default=0, metavar='N',
                         help='epochs to warmup LR')
 
     # Dataset parameters
@@ -104,9 +113,9 @@ def get_inline_arg():
 
 
     # distributed training parameters
-    parser.add_argument('--world_size', default=1, type=int,
+    parser.add_argument('--world_size', default=2, type=int,
                         help='number of distributed processes')
-    parser.add_argument('--local_rank', default=-1, type=int)
+    parser.add_argument('--local_rank', default=2, type=int)
     parser.add_argument('--dist_on_itp', action='store_true')
     parser.add_argument('--dist_url', default='env://',
                         help='url used to set up distributed training')
@@ -126,7 +135,7 @@ def setup_data_loader(args):
             'obj_file': None,
             'primitive': args.data_path,
             'batch_size': args.batch_size,
-            'epoch_size': 512,
+            'epoch_size': args.num_points_train // args.batch_size, 
             'texture_path': args.texture_path,
             'noise_mesh': args.noise_mesh or None
         }
@@ -134,7 +143,7 @@ def setup_data_loader(args):
         data_loader_train = {
             'obj_file': args.data_path,
             'batch_size': args.batch_size,
-            'epoch_size': 512,
+            'epoch_size': args.num_points_train // args.batch_size,
             'texture_path': args.texture_path,
             'noise_mesh': args.noise_mesh or None
         }
@@ -146,7 +155,7 @@ def initialize_model_and_optimizer(args,device):
     """Initialize the model, optimizer, and loss scaler."""
     
     # Initialize the model
-    model = models.__dict__[args.model](channels=3 if args.texture_path is None else 6, depth=args.depth)
+    model = models.__dict__[args.model](channels=3 if args.texture_path is None else 6, depth=args.depth,network=models.__dict__[args.network]())
     model.to(device)
     
     
@@ -172,6 +181,35 @@ def initialize_model_and_optimizer(args,device):
     print("effective batch size: %d" % eff_batch_size)
 
     return model, optimizer, loss_scaler
+
+
+def chamfer_dist(x, y, weight_x=None, weight_y=None):
+    dist = torch.cdist(x, y)
+    if weight_x is None and weight_y is None:
+        loss = dist.min(-2)[0].mean(-1) + dist.min(-1)[0].mean(-1)
+    else:
+        if weight_y is None:
+            weight_y = weight_x
+        loss = (dist.min(-2)[0] * weight_x).sum(-1) / weight_x.sum(-1) + \
+               (dist.min(-1)[0] * weight_y).sum(-1) / weight_y.sum(-1)
+
+    return loss
+def normalize_mesh(mesh):
+    rescale = max(mesh.extents) / 2.
+    tform = [
+        -(mesh.bounds[1][i] + mesh.bounds[0][i]) / 2.
+        for i in range(3)
+    ]
+    matrix = np.eye(4)
+    matrix[:3, 3] = tform
+    mesh.apply_transform(matrix)
+    matrix = np.eye(4)
+    matrix[:3, :3] /= rescale
+    mesh.apply_transform(matrix)
+    
+    return mesh
+
+
 
 
 def train_one_epoch(model: torch.nn.Module,
@@ -205,7 +243,7 @@ def train_one_epoch(model: torch.nn.Module,
 
         # Load samples from an object file
         if obj_file is not None:
-            mesh = trimesh.load(obj_file)
+            mesh = normalize_mesh(trimesh.load(obj_file))
             if len(mesh.faces)>0:
                 if data_loader['texture_path'] is not None:
                     # Load texture and apply it to the mesh
@@ -216,40 +254,42 @@ def train_one_epoch(model: torch.nn.Module,
                     mesh = trimesh.Trimesh(vertices=mesh.vertices, faces=mesh.faces, visual=texture, process=False)
 
                     # Sample points and colors from the mesh
-                    samples, _, colors = trimesh.sample.sample_surface(mesh, 2048 * 64 * 4 * 64, sample_color=True)
+                    samples, _, colors = trimesh.sample.sample_surface(mesh, args.num_points_train, sample_color=True)
                     colors = colors[:, :3]  # Remove alpha channel
                     colors = (colors.astype(np.float32) / 255.0 - 0.5) / np.sqrt(1 / 12)  # Normalize colors
                     samples = np.concatenate([samples, colors], axis=1)
                 else:
                     # Sample points from the mesh without texture
-                    samples, _ = trimesh.sample.sample_surface(mesh, 2048 * 64 * 4 * 64)
+                    samples, _ = trimesh.sample.sample_surface(mesh, args.num_points_train)
                     #samples = mesh.vertices
 
             else:
-                samples = mesh.vertices
+                #samples = mesh.vertices
+                samples, _ = trimesh.sample.sample_surface(mesh, args.num_points_train)
+
         # Generate primitive shapes if no object file is provided
         else:
             if data_loader['primitive'] == 'sphere':
-                n = torch.randn(2048 * 64 * 4 * 64, 3)
+                n = torch.randn(args.num_points_train, 3)
                 n = torch.nn.functional.normalize(n, dim=1)
                 samples = n / np.sqrt(1 / 3)
                 samples = samples.numpy()
             elif data_loader['primitive'] == 'plane':
-                samples = torch.rand(2048 * 64 * 4 * 64, 3) - 0.5
+                samples = torch.rand(args.num_points_train, 3) - 0.5
                 samples[:, 2] = 0
                 samples = (samples - 0) / np.sqrt(2 / 9 * 2 * 0.5 ** 3)
                 samples = samples.numpy()
             elif data_loader['primitive'] == 'volume':
-                samples = (torch.rand(2048 * 64 * 4 * 64, 3) - 0.5) / np.sqrt(1 / 12)
+                samples = (torch.rand(args.num_points_train, 3) - 0.5) / np.sqrt(1 / 12)
                 samples = samples.numpy()
             elif data_loader['primitive'] == 'gaussian':
-                samples = np.random.randn(2048 * 64 * 4 * 64, 3).astype(np.float32)
+                samples = np.random.randn(args.num_points_train, 3).astype(np.float32)
             else:
                 raise NotImplementedError
 
         # Load noise mesh if provided
         if data_loader['noise_mesh'] is not None:
-            noise, _ = trimesh.sample.sample_surface(trimesh.load(data_loader['noise_mesh']), 2048 * 64 * 4 * 64)
+            noise, _ = trimesh.sample.sample_surface(normalize_mesh(trimesh.load(data_loader['noise_mesh'])), args.num_points_train)
         else:
             noise = None
 
@@ -272,7 +312,7 @@ def train_one_epoch(model: torch.nn.Module,
             xyz = batch.to(device, non_blocking=True)
 
         # Forward pass and loss computation
-        with torch.amp.autocast('cuda',enabled=False):
+        with torch.amp.autocast(args.device,enabled=False):
             if noise is not None:
                 ind = np.random.default_rng().choice(noise.shape[0], batch_size, replace=True)
                 init_noise = noise[ind]
@@ -354,6 +394,138 @@ def train_one_epoch(model: torch.nn.Module,
     # Return averaged metrics
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
+
+
+
+
+def train_one_epoch_FM(model: torch.nn.Module,
+                    data_loader, optimizer: torch.optim.Optimizer,
+                    device: torch.device, epoch: int, loss_scaler, max_norm: float = 0,
+                    log_writer=None, args=None, path=None):
+
+    model.train(True)
+
+    # Initialize metric logger
+    metric_logger = misc.MetricLogger(delimiter="  ")
+    metric_logger.add_meter('lr', misc.SmoothedValue(window_size=1, fmt='{value:.6f}'))
+    header = f'Epoch: [{epoch}]'
+    print_freq = 20
+
+    # Gradient accumulation setup
+    accum_iter = args.accum_iter
+    optimizer.zero_grad()
+
+    # Log
+    if log_writer is not None:
+        print(f'log_dir: {log_writer.log_dir}')
+    print(data_loader)
+
+    noise = None   
+
+    # Load Mesh and sample points (---> this can be done in the dataloader)
+    if isinstance(data_loader, dict):
+        obj_file = data_loader['obj_file']
+        batch_size = data_loader['batch_size']
+
+        # Load samples from an object file
+        if obj_file is not None:
+            mesh = normalize_mesh(trimesh.load(obj_file))
+            # Normalize the mesh
+            mesh.apply_translation(-mesh.centroid)
+            scale_factor = 1.0 / max(mesh.bounding_box.extents)
+            mesh.apply_scale(scale_factor)
+            if len(mesh.faces)>0:
+                if data_loader['texture_path'] is not None:
+                    # Load texture and apply it to the mesh
+                    img = Image.open(data_loader['texture_path'])
+                    material = trimesh.visual.texture.SimpleMaterial(image=img)
+                    assert mesh.visual.uv is not None
+                    texture = trimesh.visual.TextureVisuals(mesh.visual.uv, image=img, material=material)
+                    mesh = trimesh.Trimesh(vertices=mesh.vertices, faces=mesh.faces, visual=texture, process=False)
+
+                    # Sample points and colors from the mesh
+                    samples, _, colors = trimesh.sample.sample_surface(mesh, args.num_points_train, sample_color=True)
+                    colors = colors[:, :3]  # Remove alpha channel
+                    colors = (colors.astype(np.float32) / 255.0 - 0.5) / np.sqrt(1 / 12)  # Normalize colors
+                    samples = np.concatenate([samples, colors], axis=1)
+                else:
+                    samples, _ = trimesh.sample.sample_surface(mesh, args.num_points_train)
+                    #samples = mesh.vertices
+
+            else:
+                samples = mesh.vertices
+
+
+        # Load noise mesh if provided
+        if data_loader['noise_mesh'] is not None:
+            noise, _ = trimesh.sample.sample_surface(normalize_mesh(trimesh.load(data_loader['noise_mesh'])), args.num_points_train)
+        else:
+            noise = None
+
+        samples = samples.astype(np.float32)
+        data_loader = range(data_loader['epoch_size'])
+
+    # Training loop
+    for data_iter_step, batch in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+
+        # Adjust learning rate per iteration
+        if data_iter_step % accum_iter == 0:
+            lr_sched.adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch, args)
+
+        # Forward pass and loss computation
+        
+        n = torch.randn(args.num_points_train, 3).to(device)
+        y = torch.tensor(samples).to(device)
+        t = torch.rand(n.shape[0], device=device)
+        path_sample = path.sample(t=t, x_0=n, x_1=y)
+
+        V_y = model(x=path_sample.x_t, sigma=path_sample.t)
+        loss = torch.mean((V_y - path_sample.dx_t) ** 2)
+        loss_value = loss.item()
+
+        # Handle invalid loss values
+        if not math.isfinite(loss_value):
+            print(f"Loss is {loss_value}, stopping training")
+            sys.exit(1)
+
+        # Backward pass and gradient update
+        loss /= accum_iter
+        loss_scaler(loss, optimizer, clip_grad=max_norm,
+                    parameters=model.parameters(), create_graph=False,
+                    update_grad=(data_iter_step + 1) % accum_iter == 0)
+        if (data_iter_step + 1) % accum_iter == 0:
+            optimizer.zero_grad()
+
+        torch.cuda.synchronize()
+
+        # Update metrics
+        metric_logger.update(loss=loss_value)
+
+        # Track learning rate
+        min_lr = 10.
+        max_lr = 0.
+        for group in optimizer.param_groups:
+            min_lr = min(min_lr, group["lr"])
+            max_lr = max(max_lr, group["lr"])
+
+        metric_logger.update(lr=max_lr)
+
+        # Log metrics to TensorBoard
+        loss_value_reduce = misc.all_reduce_mean(loss_value)
+        if log_writer is not None and (data_iter_step + 1) % accum_iter == 0:
+            epoch_1000x = int((data_iter_step / len(data_loader) + epoch) * 1000)
+            log_writer.add_scalar('loss', loss_value_reduce, epoch_1000x)
+            log_writer.add_scalar('lr', max_lr, epoch_1000x)
+
+    # Synchronize metrics across processes
+    metric_logger.synchronize_between_processes()
+    print("Averaged stats:", metric_logger)
+
+    # Return averaged metrics
+    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+
+
+
 def train(args, device):
     """Main training loop."""
     
@@ -365,61 +537,108 @@ def train(args, device):
 
     logging.info(f"Start training for {args.epochs} epochs")
     
+    mesh= normalize_mesh(trimesh.load(args.data_path))  
     start_time = time.time()
+    path= AffineProbPath(scheduler=CondOTScheduler())
+
     for epoch in range(args.start_epoch, args.epochs):
         # Train for one epoch
-        train_stats = train_one_epoch(
-            model, data_loader_train, optimizer, device, epoch, loss_scaler,
-            args.clip_grad, log_writer=None, args=args
-        )
+        if args.method=='FM':
+            train_stats = train_one_epoch_FM(
+                model, data_loader_train, optimizer, device, epoch, loss_scaler,
+                args.clip_grad, log_writer=None, args=args,path=path
+            )
+        else:
+            train_stats = train_one_epoch(
+                model, data_loader_train, optimizer, device, epoch, loss_scaler,
+                args.clip_grad, log_writer=None, args=args
+            )
+
         # Save chackpoints
-        if args.output_dir and (epoch % 5 == 0 or epoch + 1 == args.epochs):
+        if args.output_dir and (epoch % 100 == 0 or epoch + 1 == args.epochs):
             if args.distributed:
                 misc.save_model(args=args,model=model, model_without_ddp=model.module,optimizer=optimizer, loss_scaler=loss_scaler, epoch=epoch)
             else:
                 misc.save_model(args=args, model=model,model_without_ddp=model, optimizer=optimizer, loss_scaler=loss_scaler, epoch=epoch)
-                
+
+            noise = torch.randn(args.num_points_inference, 3).to(device)
+            model2 = models.__dict__[args.model](channels=3 if args.texture_path is None else 6, depth=args.depth,network=models.__dict__[args.network]())   
+            model2.to(device)
+            model2.load_state_dict(torch.load(args.output_dir + '/checkpoint-'+str(epoch)+'.pth', map_location=device,weights_only=False)['model'], strict=True)
+            sample, solutions = model2.sample(batch_seeds=noise, num_steps=args.num_steps)
+            print(f"Chamfer distance: {chamfer_dist(sample, torch.tensor(mesh.vertices).unsqueeze(0).to(device)).item()}")
+            with open(os.path.join(args.output_dir, "chamfer_distance.txt"), mode="a", encoding="utf-8") as f:
+                f.write(f"Epoch {epoch}: Chamfer distance: {chamfer_dist(sample, torch.tensor(mesh.vertices).unsqueeze(0).to(device)).item()}\n")
         #Log stats
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()}, 'epoch': epoch}
+        
         if args.output_dir and misc.is_main_process():
             with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
                 f.write(json.dumps(log_stats) + "\n")
-
+        
     total_time = time.time() - start_time
     logging.info(f"Training completed in {str(datetime.timedelta(seconds=int(total_time)))}")
 
-
+from plot import *
 def inference(args, device):
 
     #Load Final Model
-    model = models.__dict__[args.model](channels=3 if args.texture_path is None else 6, depth=args.depth)
+    model = models.__dict__[args.model](channels=3 if args.texture_path is None else 6, depth=args.depth,network=models.__dict__[args.network]())   
     model.to(device)
     model.load_state_dict(torch.load(args.output_dir + '/checkpoint-'+str(args.epochs-1)+'.pth', map_location=device,weights_only=False)['model'], strict=True)
     
     #Sample X_0
     if args.distribution == 'Gaussian':
-        noise = torch.randn(args.num_points_inference, 3).cuda()
+        noise = torch.randn(args.num_points_inference, 3).to(device)
     elif args.distribution == 'Uniform':
-        noise = (torch.rand(args.num_points_inference, 3).cuda() - 0.5) / np.sqrt(1/12)
+        noise = (torch.rand(args.num_points_inference, 3).to(device) - 0.5) / np.sqrt(1/12)
     elif args.distribution == 'Sphere':
-        n = torch.randn(args.num_points_inference, 3).cuda()
+        n = torch.randn(args.num_points_inference, 3).to(device)
         n = torch.nn.functional.normalize(n, dim=1)
         noise = n / np.sqrt(1/3)
     elif args.distribution == 'Mesh':
         assert args.noise_mesh is not None
-        noise, _ = trimesh.sample.sample_surface(trimesh.load(args.noise_mesh), args.num_points_inference)
-        noise = torch.from_numpy(noise).float().cuda()
+        noise, _ = trimesh.sample.sample_surface(normalize_mesh(trimesh.load(args.noise_mesh)), args.num_points_inference)
+        noise = torch.from_numpy(noise).float().to(device)
     else:
         raise NotImplementedError
 
     #Read Texture if needed
     if args.texture_path is not None:
-        color = (torch.rand(args.num_points_inference, 3).cuda() - 0.5) / np.sqrt(1/12)
+        color = (torch.rand(args.num_points_inference, 3).to(device) - 0.5) / np.sqrt(1/12)
         noise = torch.cat([noise, color], dim=1)
 
     #Inference
-    sample, intermediate_steps = model.sample(batch_seeds=noise, num_steps=args.num_steps)
+    sample, solutions = model.sample(batch_seeds=noise, num_steps=args.num_steps)
+    
+    start_end_subplot(sample, solutions[-1])
 
+    # Check if the velocity field is constant along iterations
+    #velocity_changes = []
+    #for i in range(len(solutions) - 1):
+    #    velocity_similarity = torch.cosine_similarity(torch.tensor(solutions[i + 1] - solutions[i]), torch.tensor(solutions[1] - solutions[0]), dim=1).mean().item()
+    #    if velocity_similarity is not None:
+    #        print(f'Iteration {i} to {i + 1}, Average Velocity Similarity: {velocity_similarity}')
+    #        velocity_changes.append(velocity_similarity)
+    #    else:
+    #        velocity_changes.append(0)
+        #print(f'Iteration {i} to {i + 1}, Average Velocity Change: {velocity_diff}')
+    #import matplotlib.pyplot as plt
+    #import numpy as np
+
+    # Plot velocity similarity across iterations
+    #iterations = list(range(1, len(solutions) ))
+    #plt.figure(figsize=(10, 6))
+    #plt.plot(iterations, np.array(velocity_changes), marker='o', linestyle='-', color='b')
+    #plt.title('Velocity Similarity Across Iterations')
+    #plt.xlabel('Iteration')
+    #plt.ylabel('Average Velocity Similarity')
+    #plt.grid(True)
+    #plt.savefig(f'velocity-similarity.png')
+    #plt.close()
+    #print(f'Average Velocity Change Across All Iterations: {sum(velocity_changes) / len(velocity_changes)}')
+
+    
     #Save Results
     if args.texture_path is not None:
         sample = sample.detach().cpu().numpy()
