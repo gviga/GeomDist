@@ -465,17 +465,18 @@ def train(args, device):
                     misc.save_model(args=args, model=model,model_without_ddp=model, optimizer=optimizer, loss_scaler=loss_scaler, epoch=epoch)
 
             if args.distribution == 'Gaussian':
-                noise = torch.randn(args.num_points_train, 3).to(device)
+                noise = torch.randn(args.num_points_inference, 3).to(device)
 
             elif args.distribution == 'Sphere':
                 noise = sample_sphere_volume(
                         radius=1,
                         center=(0, 0, 0),
-                        num_points=args.num_points_train
+                        num_points=args.num_points_inference
                         ).to(device)
 
             model.eval()
-            sample, solutions = model.sample(batch_seeds=noise, num_steps=args.num_steps)
+            with torch.no_grad:
+                sample, solutions = model.sample(batch_seeds=noise, num_steps=args.num_steps)
             print(f"Chamfer distance: {chamfer_dist(sample, torch.tensor(mesh.vertices).unsqueeze(0).to(device)).item()}")
             with open(os.path.join(args.output_dir, "chamfer_distance.txt"), mode="a", encoding="utf-8") as f:
                 f.write(f"Epoch {epoch}: Chamfer distance: {chamfer_dist(sample, torch.tensor(mesh.vertices).unsqueeze(0).to(device)).item()}\n")
@@ -512,7 +513,8 @@ def inference(args, device):
                 ).to(device)
 
     #Inference
-    sample, solutions = model.sample(batch_seeds=noise, num_steps=args.num_steps)
+    with torch.no_grad:
+        sample, solutions = model.sample(batch_seeds=noise, num_steps=args.num_steps)
     
     start_end_subplot(noise.cpu(), sample.cpu())
 

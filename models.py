@@ -56,7 +56,7 @@ class EDMPrecond(torch.nn.Module):
     def round_sigma(self, sigma):
         return torch.as_tensor(sigma)
 
-    @torch.no_grad()
+    #@torch.no_grad()
     def sample(self, cond=None, batch_seeds=None, channels=3, num_steps=18):
 
         device = batch_seeds.device
@@ -549,7 +549,7 @@ class FMCond(torch.nn.Module):
     def round_sigma(self, sigma):
         return torch.as_tensor(sigma)
 
-    @torch.no_grad()
+    #@torch.no_grad()
     def sample(self, cond=None, batch_seeds=None, channels=3, num_steps=64):
 
         device = batch_seeds.device
