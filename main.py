@@ -27,12 +27,16 @@ import util.lr_sched as lr_sched
 from flow_matching.path.scheduler import CondOTScheduler
 from flow_matching.path import AffineProbPath
 from flow_matching.solver import ODESolver
-
+from losses import chamfer_dist
 
 from PIL import Image
+from utils import *
+from plot import *
 
-torch.cuda.set_device('cuda:1')
+torch.cuda.set_device('cuda:0')
 
+# Constants
+NEURAL_RENDERING_RESOLUTION = 128
 
 
 def get_inline_arg():
@@ -40,19 +44,19 @@ def get_inline_arg():
     # common parameters
     parser.add_argument('--config', default='config.json', type=str, help='Path to the config file')    # Model parameters
     parser.add_argument('--method', default='FM', type=str, help='Method used for training')
-    parser.add_argument('--network', default='Network', type=str, help='Network used for training')
+    parser.add_argument('--network', default='MLP', type=str, help='Network used for training')
     parser.add_argument("--train", action="store_true", help="Train a <run_name> model")
     parser.add_argument("--inference", action="store_true", help="Perform inference on the <run_name> model")
-    parser.add_argument('--device', default='cuda:1',
+    parser.add_argument('--device', default='cuda:0',
                         help='device to use for training / testing')
     parser.add_argument('--seed', default=21, type=int)
-    parser.add_argument('--epochs', default=1000, type=int)
-    parser.add_argument('--learning_rate', type=float, default=None, metavar='LR',
+    parser.add_argument('--epochs', default=10000, type=int)
+    parser.add_argument('--learning_rate', type=float, default=0.01, metavar='LR',
                         help='learning rate (absolute lr)')
-    parser.add_argument('--batch_size', default=1024*64*2,type=int,help='Batch size per GPU (effective batch size is batch_size * accum_iter * # gpus')
+    parser.add_argument('--batch_size', default=10000,type=int,help='Batch size per GPU (effective batch size is batch_size * accum_iter * # gpus') #1024*64*
     #parser.add_argument('--num_points_train', default=10000, type=int, help='Number of points for training the vector field')
     parser.add_argument('--num_points_inference', default=10000, type=int, help='Number of points for inference')
-    parser.add_argument('--num_points_train', default=2048 * 64 * 4 * 64, type=int, help='Number of points for inference')
+    parser.add_argument('--num_points_train', default=10000, type=int, help='Number of points for inference')#2048 * 64 * 4 * 64
 
     parser.add_argument('--accum_iter', default=1, type=int,
                         help='Accumulate gradient iterations (for increasing the effective batch size under memory constraints)')
@@ -125,8 +129,6 @@ def get_inline_arg():
     return args
 
 
-# Constants
-NEURAL_RENDERING_RESOLUTION = 128
 
 def setup_data_loader(args):
     """Set up the data loader based on the input data path."""
@@ -183,32 +185,6 @@ def initialize_model_and_optimizer(args,device):
     return model, optimizer, loss_scaler
 
 
-def chamfer_dist(x, y, weight_x=None, weight_y=None):
-    dist = torch.cdist(x, y)
-    if weight_x is None and weight_y is None:
-        loss = dist.min(-2)[0].mean(-1) + dist.min(-1)[0].mean(-1)
-    else:
-        if weight_y is None:
-            weight_y = weight_x
-        loss = (dist.min(-2)[0] * weight_x).sum(-1) / weight_x.sum(-1) + \
-               (dist.min(-1)[0] * weight_y).sum(-1) / weight_y.sum(-1)
-
-    return loss
-def normalize_mesh(mesh):
-    rescale = max(mesh.extents) / 2.
-    tform = [
-        -(mesh.bounds[1][i] + mesh.bounds[0][i]) / 2.
-        for i in range(3)
-    ]
-    matrix = np.eye(4)
-    matrix[:3, 3] = tform
-    mesh.apply_transform(matrix)
-    matrix = np.eye(4)
-    matrix[:3, :3] /= rescale
-    mesh.apply_transform(matrix)
-    
-    return mesh
-
 
 
 
@@ -244,53 +220,11 @@ def train_one_epoch(model: torch.nn.Module,
         # Load samples from an object file
         if obj_file is not None:
             if len(mesh.faces)>0:
-                if data_loader['texture_path'] is not None:
-                    # Load texture and apply it to the mesh
-                    img = Image.open(data_loader['texture_path'])
-                    material = trimesh.visual.texture.SimpleMaterial(image=img)
-                    assert mesh.visual.uv is not None
-                    texture = trimesh.visual.TextureVisuals(mesh.visual.uv, image=img, material=material)
-                    mesh = trimesh.Trimesh(vertices=mesh.vertices, faces=mesh.faces, visual=texture, process=False)
-
-                    # Sample points and colors from the mesh
-                    samples, _, colors = trimesh.sample.sample_surface(mesh, args.num_points_train, sample_color=True)
-                    colors = colors[:, :3]  # Remove alpha channel
-                    colors = (colors.astype(np.float32) / 255.0 - 0.5) / np.sqrt(1 / 12)  # Normalize colors
-                    samples = np.concatenate([samples, colors], axis=1)
-                else:
-                    # Sample points from the mesh without texture
-                    samples, _ = trimesh.sample.sample_surface(mesh, args.num_points_train)
-                    #samples = mesh.vertices
-
-            else:
-                #samples = mesh.vertices
+                # Sample points from the mesh without texture
                 samples, _ = trimesh.sample.sample_surface(mesh, args.num_points_train)
-
-        # Generate primitive shapes if no object file is provided
-        else:
-            if data_loader['primitive'] == 'sphere':
-                n = torch.randn(args.num_points_train, 3)
-                n = torch.nn.functional.normalize(n, dim=1)
-                samples = n / np.sqrt(1 / 3)
-                samples = samples.numpy()
-            elif data_loader['primitive'] == 'plane':
-                samples = torch.rand(args.num_points_train, 3) - 0.5
-                samples[:, 2] = 0
-                samples = (samples - 0) / np.sqrt(2 / 9 * 2 * 0.5 ** 3)
-                samples = samples.numpy()
-            elif data_loader['primitive'] == 'volume':
-                samples = (torch.rand(args.num_points_train, 3) - 0.5) / np.sqrt(1 / 12)
-                samples = samples.numpy()
-            elif data_loader['primitive'] == 'gaussian':
-                samples = np.random.randn(args.num_points_train, 3).astype(np.float32)
             else:
-                raise NotImplementedError
-
-        # Load noise mesh if provided
-        if data_loader['noise_mesh'] is not None:
-            noise, _ = trimesh.sample.sample_surface(normalize_mesh(trimesh.load(data_loader['noise_mesh'])), args.num_points_train)
-        else:
-            noise = None
+                samples = mesh.vertices
+                #samples, _ = trimesh.sample.sample_surface(mesh, args.num_points_train)
 
         samples = samples.astype(np.float32)
         data_loader = range(data_loader['epoch_size'])
@@ -312,13 +246,6 @@ def train_one_epoch(model: torch.nn.Module,
 
         # Forward pass and loss computation
         with torch.amp.autocast(args.device,enabled=False):
-            if noise is not None:
-                ind = np.random.default_rng().choice(noise.shape[0], batch_size, replace=True)
-                init_noise = noise[ind]
-                init_noise = torch.from_numpy(init_noise).float().to(device, non_blocking=True)
-            else:
-                init_noise = None
-
             # Sample noise  ---> noysis step
             rnd_normal = torch.randn([xyz.shape[0],], device=xyz.device)
 
@@ -339,10 +266,6 @@ def train_one_epoch(model: torch.nn.Module,
                 n = torch.nn.functional.normalize(n, dim=1)
                 n /= np.sqrt(1/3)
                 n = n * sigma[:, None]
-
-            elif args.distribution == "Mesh":
-                assert init_noise is not None
-                n = init_noise * sigma[:, None]
             else:
                 raise NotImplementedError
             
@@ -395,8 +318,6 @@ def train_one_epoch(model: torch.nn.Module,
 
 
 
-
-
 def train_one_epoch_FM(model: torch.nn.Module,
                     data_loader, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, loss_scaler, max_norm: float = 0,
@@ -430,32 +351,11 @@ def train_one_epoch_FM(model: torch.nn.Module,
         if obj_file is not None:
             # Normalize the mesh
             if len(mesh.faces)>0:
-                if data_loader['texture_path'] is not None:
-                    # Load texture and apply it to the mesh
-                    img = Image.open(data_loader['texture_path'])
-                    material = trimesh.visual.texture.SimpleMaterial(image=img)
-                    assert mesh.visual.uv is not None
-                    texture = trimesh.visual.TextureVisuals(mesh.visual.uv, image=img, material=material)
-                    mesh = trimesh.Trimesh(vertices=mesh.vertices, faces=mesh.faces, visual=texture, process=False)
-
-                    # Sample points and colors from the mesh
-                    samples, _, colors = trimesh.sample.sample_surface(mesh, args.num_points_train, sample_color=True)
-                    colors = colors[:, :3]  # Remove alpha channel
-                    colors = (colors.astype(np.float32) / 255.0 - 0.5) / np.sqrt(1 / 12)  # Normalize colors
-                    samples = np.concatenate([samples, colors], axis=1)
-                else:
-                    samples, _ = trimesh.sample.sample_surface(mesh, args.num_points_train)
-                    #samples = mesh.vertices
+                samples, _ = trimesh.sample.sample_surface(mesh, args.num_points_train)
+                #samples = mesh.vertices
 
             else:
                 samples = mesh.vertices
-
-
-        # Load noise mesh if provided
-        if data_loader['noise_mesh'] is not None:
-            noise, _ = trimesh.sample.sample_surface(normalize_mesh(trimesh.load(data_loader['noise_mesh'])), args.num_points_train)
-        else:
-            noise = None
 
         samples = samples.astype(np.float32)
         data_loader = range(data_loader['epoch_size'])
@@ -467,9 +367,16 @@ def train_one_epoch_FM(model: torch.nn.Module,
         if data_iter_step % accum_iter == 0:
             lr_sched.adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch, args)
 
-        # Forward pass and loss computation
-        
-        n = torch.randn(args.num_points_train, 3).to(device)
+        if args.distribution == 'Gaussian':
+            n = torch.randn(args.num_points_train, 3).to(device)
+        elif args.distribution == 'Sphere':
+            n = sample_sphere_volume(
+                    radius=1,
+                    center=(0, 0, 0),
+                    num_points=args.num_points_train
+                    ).to(device)
+
+    
         y = torch.tensor(samples).to(device)
         t = torch.rand(n.shape[0], device=device)
         path_sample = path.sample(t=t, x_0=n, x_1=y)
@@ -551,13 +458,19 @@ def train(args, device):
 
         # Save checkpoints
         if args.output_dir and (epoch % 100 == 0 or epoch + 1 == args.epochs):
-            if args.output_dir and (epoch % 1000 == 0 or epoch + 1 == args.epochs):
+            if epoch + 1 == args.epochs:
                 if args.distributed:
                     misc.save_model(args=args,model=model, model_without_ddp=model.module,optimizer=optimizer, loss_scaler=loss_scaler, epoch=epoch)
                 else:
                     misc.save_model(args=args, model=model,model_without_ddp=model, optimizer=optimizer, loss_scaler=loss_scaler, epoch=epoch)
 
-            noise = torch.randn(args.num_points_inference, 3).to(device)
+            noise = sample_sphere_volume(
+                    radius=1,
+                    center=(0, 0, 0),
+                    num_points=args.num_points_inference
+                    ).to(device)
+
+            #n = torch.randn(args.num_points_inference, 3).to(device)
             model.eval()
             sample, solutions = model.sample(batch_seeds=noise, num_steps=args.num_steps)
             print(f"Chamfer distance: {chamfer_dist(sample, torch.tensor(mesh.vertices).unsqueeze(0).to(device)).item()}")
@@ -574,7 +487,8 @@ def train(args, device):
     total_time = time.time() - start_time
     logging.info(f"Training completed in {str(datetime.timedelta(seconds=int(total_time)))}")
 
-from plot import *
+
+
 def inference(args, device):
 
     #Load Final Model
@@ -583,25 +497,16 @@ def inference(args, device):
     model.load_state_dict(torch.load(args.output_dir + '/checkpoint-'+str(args.epochs-1)+'.pth', map_location=device,weights_only=False)['model'], strict=True)
     
     #Sample X_0
-    if args.distribution == 'Gaussian':
-        noise = torch.randn(args.num_points_inference, 3).to(device)
-    elif args.distribution == 'Uniform':
-        noise = (torch.rand(args.num_points_inference, 3).to(device) - 0.5) / np.sqrt(1/12)
-    elif args.distribution == 'Sphere':
-        n = torch.randn(args.num_points_inference, 3).to(device)
-        n = torch.nn.functional.normalize(n, dim=1)
-        noise = n / np.sqrt(1/3)
-    elif args.distribution == 'Mesh':
-        assert args.noise_mesh is not None
-        noise, _ = trimesh.sample.sample_surface(normalize_mesh(trimesh.load(args.noise_mesh)), args.num_points_inference)
-        noise = torch.from_numpy(noise).float().to(device)
-    else:
-        raise NotImplementedError
 
-    #Read Texture if needed
-    if args.texture_path is not None:
-        color = (torch.rand(args.num_points_inference, 3).to(device) - 0.5) / np.sqrt(1/12)
-        noise = torch.cat([noise, color], dim=1)
+    if args.distribution == 'Gaussian':
+        noise = torch.randn(args.num_points_train, 3).to(device)
+
+    elif args.distribution == 'Sphere':
+        noise = sample_sphere_volume(
+                radius=1,
+                center=(0, 0, 0),
+                num_points=args.num_points_train
+                ).to(device)
 
     #Inference
     sample, solutions = model.sample(batch_seeds=noise, num_steps=args.num_steps)
@@ -635,27 +540,7 @@ def inference(args, device):
 
     
     #Save Results
-    if args.texture_path is not None:
-        sample = sample.detach().cpu().numpy()
-        vertices, colors = sample[:, :3], sample[:, 3:]
-        colors = (colors * np.sqrt(1/12) + 0.5) * 255.0
-        colors = np.concatenate([colors, np.ones_like(colors[:, 0:1]) * 255.0], axis=1).astype(np.uint8) # alpha channel
-        trimesh.PointCloud(vertices, colors).export(os.path.join(args.output_dir, 'sample.ply'))
-
-        if args.intermediate:
-            for i, s in enumerate(intermediate_steps):
-                vertices, colors = s[:, :3], s[:, 3:]
-                colors = (colors * np.sqrt(1/12) + 0.5) * 255.0
-                colors = np.concatenate([colors, np.ones_like(colors[:, 0:1]) * 255.0], axis=1).astype(np.uint8) # alpha channel
-
-                trimesh.PointCloud(vertices, colors).export(os.path.join(args.output_dir, 'sample-{:03d}.ply'.format(i)))
-    else:
-        trimesh.PointCloud(sample.detach().cpu().numpy()).export(os.path.join(args.output_dir, 'sample.ply'))
-
-        if args.intermediate:
-            for i, s in enumerate(intermediate_steps):
-                trimesh.PointCloud(s).export(os.path.join(args.output_dir, 'sample-{:03d}.ply'.format(i)))
-
+    trimesh.PointCloud(sample.detach().cpu().numpy()).export(os.path.join(args.output_dir, 'sample.ply'))
 
 
 def main():
