@@ -53,7 +53,7 @@ def get_inline_arg():
     parser.add_argument('--epochs', default=10000, type=int)
     parser.add_argument('--learning_rate', type=float, default=0.01, metavar='LR',
                         help='learning rate (absolute lr)')
-    parser.add_argument('--batch_size', default=10000,type=int,help='Batch size per GPU (effective batch size is batch_size * accum_iter * # gpus') #1024*64*
+    parser.add_argument('--batch_size', default=10000,type=int,help='Batch size per GPU (effective batch size is batch_size * accum_iter * # gpus') #1024*64*2
     #parser.add_argument('--num_points_train', default=10000, type=int, help='Number of points for training the vector field')
     parser.add_argument('--num_points_inference', default=10000, type=int, help='Number of points for inference')
     parser.add_argument('--num_points_train', default=10000, type=int, help='Number of points for inference')#2048 * 64 * 4 * 64
@@ -464,13 +464,16 @@ def train(args, device):
                 else:
                     misc.save_model(args=args, model=model,model_without_ddp=model, optimizer=optimizer, loss_scaler=loss_scaler, epoch=epoch)
 
-            noise = sample_sphere_volume(
-                    radius=1,
-                    center=(0, 0, 0),
-                    num_points=args.num_points_inference
-                    ).to(device)
+            if args.distribution == 'Gaussian':
+                noise = torch.randn(args.num_points_train, 3).to(device)
 
-            #n = torch.randn(args.num_points_inference, 3).to(device)
+            elif args.distribution == 'Sphere':
+                noise = sample_sphere_volume(
+                        radius=1,
+                        center=(0, 0, 0),
+                        num_points=args.num_points_train
+                        ).to(device)
+
             model.eval()
             sample, solutions = model.sample(batch_seeds=noise, num_steps=args.num_steps)
             print(f"Chamfer distance: {chamfer_dist(sample, torch.tensor(mesh.vertices).unsqueeze(0).to(device)).item()}")
