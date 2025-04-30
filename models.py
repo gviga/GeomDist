@@ -47,7 +47,7 @@ class EDMPrecond(torch.nn.Module):
         c_in = 1 / (self.sigma_data ** 2 + sigma ** 2).sqrt()
         c_noise = sigma.log() / 4
     
-        F_x = self.model((c_in * x).to(dtype), c_noise.flatten(), **model_kwargs)
+        F_x = self.model((c_in * x).to(dtype), c_noise, **model_kwargs).to(dtype)
         assert F_x.dtype == dtype
         D_x = c_skip * x + c_out * F_x.to(torch.float32)
 
@@ -365,11 +365,10 @@ class Network(nn.Module):
 
     def forward(self, x, t):
         x = self.x_embedder(x)
-
-        if t.shape[0] == 1:
+        if t.ndim == 1:
             t = t.repeat(x.shape[0])
 
-        t = mp_silu(self.emb_noise(self.emb_fourier(t)))
+        t = mp_silu(self.emb_noise(self.emb_fourier(t.flatten())))
 
         for (x_proj_pre, x_proj_post, emb_linear), emb_gain in zip(self.layers, self.gains):
 
@@ -516,6 +515,49 @@ class MLP(nn.Module):
         return output
 
 
+class MLP_dd(nn.Module):
+    def __init__(self,
+        channels = 3,
+        hidden_size = 256,
+        depth = 6,):
+    #input_dim: int = 3, time_dim: int = 1, hidden_dim: int = 128, fourier_encoding: str = 'FF', fourier_dim: int = 0):
+        super().__init__()
+        self.input_dim = channels
+        self.hidden_dim = hidden_size
+        self.ff_module = FourierFeatsEncoding(in_dim=4, num_frequencies=6, include_input=True)
+        self.fourier_dim = ((3+1) * 6 * 2) + (3 + 1) + 5
+        self.rff_module = nn.Identity()
+
+        self.main = nn.Sequential(
+            nn.Linear(self.fourier_dim, self.hidden_dim),
+            Swish(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            Swish(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            Swish(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            Swish(),
+            nn.Linear(self.hidden_dim, self.input_dim),
+        )
+    
+
+    def forward(self, x, t):
+        sz = x.size()
+        t = t.reshape(-1, 1)        
+        t = t.reshape(-1, 1).expand(x.shape[0], 1)
+        xyz=x[:,:3]
+        h = torch.cat([xyz, t], dim=1)
+        
+        h = self.rff_module(h)
+        h = self.ff_module(h)
+       
+
+        output = self.main(torch.cat([h, x[:,3:]], dim=1))
+        #output = output.reshape((-1,8))
+        
+        return output
+
+
 
 
 class FMCond(torch.nn.Module):
@@ -538,11 +580,196 @@ class FMCond(torch.nn.Module):
             self.net = MLP(channels=channels, hidden_size=512, depth=depth)
 
     def forward(self, x, sigma):
-
         x = x
         sigma = sigma.to(torch.float32).reshape(-1, 1)
+        V_x = self.net(x, sigma).to(torch.float32)
 
-        V_x = self.net(x, sigma)
+        return V_x
+
+    def round_sigma(self, sigma):
+        return torch.as_tensor(sigma)
+
+    #@torch.no_grad()
+    def sample(self, cond=None, batch_seeds=None, channels=3, num_steps=64,enable_grad=False, intermediate=False):
+
+        device = batch_seeds.device
+        batch_size = batch_seeds.shape[0]
+
+        rnd = None
+        points = batch_seeds
+
+        latents = points.float().to(device)
+
+        if intermediate:
+            sample,sol=ot_sampler(self.net, latents, num_steps=num_steps,enable_grad=enable_grad, intermediate=intermediate)
+            return sample, sol
+        else:
+            sample=ot_sampler(self.net, latents, num_steps=num_steps,enable_grad=enable_grad,intermediate=intermediate)
+            return sample
+    
+    def inverse(self, cond=None, samples=None, channels=3, num_steps=18,enable_grad=False,intermediate=False):
+
+        device = samples.device
+        batch_size = samples.shape[0]
+
+        rnd = None
+        points = samples
+
+        latents = points.float().to(device)
+
+        if intermediate:
+            sample,sol=ot_inverse(self.net, latents, num_steps=num_steps,enable_grad=enable_grad, intermediate=intermediate)
+            
+            return sample, sol
+        else:
+            sample=ot_inverse(self.net, latents, num_steps=num_steps,enable_grad=enable_grad, intermediate=intermediate)
+            
+            return sample
+        
+        
+from flow_matching.solver import ODESolver
+
+def ot_sampler(
+    net, latents,num_steps=18, enable_grad=False, intermediate=False):  
+
+    # Time step discretization.
+    t_steps = torch.linspace(0, 1, num_steps+1)
+    # Main sampling loop.
+    solver = ODESolver(velocity_model=net)
+    solutions = solver.sample(time_grid=t_steps, x_init=latents, method='midpoint', step_size=1/num_steps, return_intermediates=intermediate,enable_grad=enable_grad)
+
+    if intermediate:
+        return solutions[-1], solutions
+    else:
+        return solutions
+
+def ot_inverse(    net, sample,
+    num_steps=18, enable_grad=False, intermediate=False):
+    
+    # Time step discretization.
+    t_steps = torch.linspace(0, 1, num_steps+1)
+    # Main sampling loop.
+    inverse_net=InverseModel(net)
+    solver = ODESolver(velocity_model=inverse_net)
+    solutions = solver.sample(time_grid=t_steps, x_init=sample, method='midpoint', step_size=1/num_steps, return_intermediates=intermediate,enable_grad=enable_grad)
+
+    if intermediate:
+        
+        return solutions[-1], solutions
+    else:
+        return solutions
+
+
+
+class InverseModel(torch.nn.Module):
+    def __init__(self, vector_field):
+        super(InverseModel, self).__init__()
+        self.vector_field = vector_field
+
+    def forward(self, x,t):
+        if torch.allclose(t, torch.ones_like(t)):
+            return torch.zeros_like(x)
+        return -self.vector_field(x,1-t)
+    
+
+
+
+###########àà
+
+import tinycudann as tcnn
+
+
+
+class MLP_tiny(nn.Module):
+    def __init__(self,
+        channels = 3,
+        hidden_size = 256,
+        depth = 6,):
+    #input_dim: int = 3, time_dim: int = 1, hidden_dim: int = 128, fourier_encoding: str = 'FF', fourier_dim: int = 0):
+        super().__init__()
+        self.input_dim = channels
+        self.hidden_dim = hidden_size
+        
+        self.config={
+            "encoding": {
+                "otype": "HashGrid",
+                "n_levels": 16,
+                "n_features_per_level": 2,
+                "log2_hashmap_size": 16,
+                "base_resolution": 16,
+                "per_level_scale": 2
+            },
+            "network": {
+                "otype": "FullyFusedMLP",
+                "activation": "ReLu",
+                "output_activation": "None",
+                "n_neurons": 128,
+                "n_hidden_layers": 6
+            }
+        }
+        self.fourier_dim = ((3+1) * 6 * 2) + (3 + 1)
+        self.ff_module = FourierFeatsEncoding(in_dim=4, num_frequencies=6, include_input=True)
+        self.rff_module = nn.Identity()
+
+
+        #self.main = tcnn.NetworkWithInputEncoding(4, 3,self.config["encoding"], self.config["network"])
+        self.encoding = tcnn.Encoding(4, self.config["encoding"])
+        #self.main =  tcnn.Network(self.encoding.n_output_dims+4, 3, self.config["network"])
+
+    
+        self.main = nn.Sequential(
+                nn.Linear(self.encoding.n_output_dims+ self.fourier_dim, self.hidden_dim),
+                Swish(),
+                nn.Linear(self.hidden_dim, self.hidden_dim),
+                Swish(),
+                nn.Linear(self.hidden_dim, self.hidden_dim),
+                Swish(),
+                nn.Linear(self.hidden_dim, self.hidden_dim),
+                Swish(),
+                nn.Linear(self.hidden_dim, self.input_dim),
+            )
+    def forward(self, x, t):
+        sz = x.size()
+        t = t.reshape(-1, 1)        
+        t = t.reshape(-1, 1).expand(x.shape[0], 1)
+
+        h = torch.cat([x, t], dim=1)
+        
+        h_ff = self.ff_module(h)
+        h_ngp=self.encoding(h).to(torch.float32)
+        
+        output = self.main(torch.cat([h_ff, h_ngp], dim=1))
+        output = output.reshape(*sz)
+        
+        return output
+    
+    
+########################### DEFORMATION PYRAMYD ##########################
+
+
+class FMCond_NDP(torch.nn.Module):
+    def __init__(self,
+        channels = 3, 
+        use_fp16 = False,
+        sigma_min = 0,
+        sigma_max = float('inf'),
+        sigma_data  = 1,
+        depth = 6,
+        network = None,
+    ):
+        super().__init__()
+
+        self.use_fp16 = use_fp16
+
+        if network is not None:
+            self.net = network
+        else:
+            self.net = MLP(channels=channels, hidden_size=512, depth=depth)
+
+    def forward(self, x, sigma,max_level=0, min_level=0):
+        x = x
+        sigma = sigma.to(torch.float32).reshape(-1, 1)
+        V_x = self.net(x=x, t=sigma, max_level=max_level, min_level=min_level).to(torch.float32)
 
         return V_x
 
@@ -564,23 +791,106 @@ class FMCond(torch.nn.Module):
         
         return sample.to(torch.double), sol
     @torch.no_grad()
+    
     def inverse(self, cond=None, samples=None, channels=3, num_steps=18):
-        return inverse_edm_sampler(self, samples, cond, num_steps=num_steps)
+
+        device = samples.device
+        batch_size = samples.shape[0]
+
+        rnd = None
+        points = samples
+
+        latents = points.float().to(device)
+
+        sample,sol=ot_inverse(self.net, latents, cond, num_steps=num_steps)
+        
+        return sample.to(torch.double), sol
 
 
-from flow_matching.solver import ODESolver
+class Deformation_Pyramid(nn.Module):
+    def __init__(self, depth=4, width=256, device='cuda:0', k0=-9, m=9):
+        super(Deformation_Pyramid, self).__init__()
+        pyramid = []
 
-def ot_sampler(
-    net, latents, class_labels=None, randn_like=torch.randn_like,
-    num_steps=18, sigma_min=0.002, sigma_max=80, rho=7,
-    S_churn=0, S_min=0, S_max=float('inf'), S_noise=1,
-):  
+        for i in range (m):
+            pyramid.append(
+                NDPLayer(depth,
+                         width,
+                         k0,
+                         i,
+                         ).to(device)
+            )
+        self.pyramid = pyramid
+        self.n_hierarchy = m
+        self.current_max=0
+    def forward(self, x,t, max_level=None, min_level=0):
+        if max_level is None:
+            max_level = self.current_max
+        assert max_level < self.n_hierarchy, "more level than defined"
+        sz = x.size()
+        t = t.reshape(-1, 1)        
+        t = t.reshape(-1, 1).expand(x.shape[0], 1)
+        x_in = x
+        input=torch.cat([x_in, t], dim=-1)
+        out_ini= 0
+        for i in range(min_level, max_level + 1):
+            out_ini =  out_ini+0.01*self.pyramid[i](input)
+        return out_ini
 
-    # Time step discretization.
-    t_steps = torch.linspace(0, 1, num_steps+1)
-    # Main sampling loop.
-    solver = ODESolver(velocity_model=net)
-    solutions = solver.sample(time_grid=t_steps, x_init=latents, method='midpoint', step_size=1/num_steps, return_intermediates=True)
+    def gradient_setup(self, optimized_level):
 
-    return solutions[-1], solutions
+        assert optimized_level < self.n_hierarchy, "more level than defined"
 
+        # optimize current level, freeze the other levels
+        for i in range( self.n_hierarchy):
+            net = self.pyramid[i]
+            if i == optimized_level:
+                for param in net.parameters():
+                    param.requires_grad = True
+            else:
+                for param in net.parameters():
+                    param.requires_grad = False
+
+
+
+class NDPLayer(nn.Module):
+    def __init__(self, depth, width, k0, m):
+        super().__init__()
+
+        self.k0 = k0
+        self.m = m
+        self.ff_module = FourierFeatsEncoding(in_dim=4, num_frequencies=m, include_input=True)
+        self.fourier_dim = ((3+1) * m * 2) + (3 + 1)
+
+        self.input= nn.Sequential( nn.Linear( self.fourier_dim,width), Swish())
+        self.mlp = MLP_ndp(depth=depth,width=width)
+
+        self.out_branch = nn.Linear(width, 3) # scale branch
+
+        self._reset_parameters()
+
+    def forward (self, x):
+
+        fea = self.ff_module( x )
+        fea = self.input(fea)
+        fea = self.mlp(fea)
+
+        return self.out_branch(fea)
+    
+
+    def _reset_parameters(self):
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+
+import torch.nn.functional as F   
+class MLP_ndp(torch.nn.Module):
+    def __init__(self, depth, width):
+        super().__init__()
+        self.pts_linears = nn.ModuleList( [nn.Linear(width, width) for i in range(depth - 1)])
+        self.act = Swish()
+    def forward(self, x):
+        for i, l in enumerate(self.pts_linears):
+            x = self.pts_linears[i](x)
+            x = self.act(x)
+        return x

@@ -18,11 +18,11 @@ def normalize_mesh(mesh):
     return mesh
 
 
-def sample_sphere_volume(radius, center, num_points):
-    center = torch.tensor(center, dtype=torch.float32)
-    r = radius * torch.rand(num_points) ** (1/3)         # Sample radius with proper scaling for uniform distribution
-    theta = torch.rand(num_points) * 2 * np.pi           # Azimuthal angle
-    phi = torch.acos(1 - 2 * torch.rand(num_points))     # Polar angle
+def sample_sphere_volume(radius, center, num_points,device='cuda'):
+    center = torch.tensor(center, dtype=torch.float32,device=device)
+    r = radius * torch.rand(num_points,device=device)    ** (1/3)   # Sample radius with proper scaling for uniform distribution
+    theta = torch.rand(num_points,device=device)    * 2 * np.pi           # Azimuthal angle
+    phi = torch.acos(1 - 2 * torch.rand(num_points,device=device)   )     # Polar angle
 
     # Convert to Cartesian coordinates
     x = r * torch.sin(phi) * torch.cos(theta)

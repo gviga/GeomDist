@@ -33,8 +33,11 @@ from PIL import Image
 from utils import *
 from plot import *
 
+from matching_utils import compute_geodesic_distances, compute_euclidean_distances
 # Constants
 NEURAL_RENDERING_RESOLUTION = 128
+
+lm=np.array( [412, 5891,6593,3323,2119] )
 
 
 def get_inline_arg():
@@ -153,7 +156,7 @@ def initialize_model_and_optimizer(args,device):
     """Initialize the model, optimizer, and loss scaler."""
     
     # Initialize the model
-    model = models.__dict__[args.model](channels=3 if args.texture_path is None else 6, depth=args.depth,network=models.__dict__[args.network]())
+    model = models.__dict__[args.model](channels=8, depth=args.depth,network=models.__dict__[args.network](channels=8))
     model.to(device)
     
     
@@ -322,7 +325,7 @@ def train_one_epoch(model: torch.nn.Module,
 def train_one_epoch_FM(model: torch.nn.Module,
                     data_loader, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, loss_scaler, max_norm: float = 0,
-                    log_writer=None, args=None, path=None,mesh=None):
+                    log_writer=None, args=None, path=None,mesh=None,feats=None):
 
     model.train(True)
 
@@ -351,13 +354,17 @@ def train_one_epoch_FM(model: torch.nn.Module,
         # Load samples from an object file
         if obj_file is not None:
             # Normalize the mesh
-            if len(mesh.faces)>0:
-                samples, _ = trimesh.sample.sample_surface(mesh, args.num_points_train)
+            #if len(mesh.faces)>0:
+                #samples, _ = trimesh.sample.sample_surface(mesh, args.num_points_train)
                 #samples = mesh.vertices
 
-            else:
-                samples = mesh.vertices
+            #else:
+            samples = mesh.vertices
+            feats=feats
 
+            #threshold = torch.quantile(feats, 0.5)  # Get the 10th percentile value
+            #feats = torch.clamp(feats - threshold, min=0).to(device)
+            
         samples = samples.astype(np.float32)
         data_loader = range(data_loader['epoch_size'])
 
@@ -367,10 +374,11 @@ def train_one_epoch_FM(model: torch.nn.Module,
         if data_iter_step % accum_iter == 0:
             lr_sched.adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch, args)
         
-        y = torch.tensor(samples).to(device)
+        y = torch.tensor(torch.cat([torch.tensor(samples).to(device),feats.T],-1)).to(torch.float32)
+        y=y[torch.randperm(y.shape[0])]
 
         if args.distribution == 'Gaussian':
-            n = torch.randn(args.num_points_train, 3).to(device)
+            n = torch.randn(y.shape[0], 8).to(device)
         elif args.distribution == 'Sphere':
             n = sample_sphere_volume(
                     radius=1,
@@ -381,14 +389,12 @@ def train_one_epoch_FM(model: torch.nn.Module,
             n = torch.randn_like(y[:,:3], dtype=torch.float32,device=device)
             n += y[:,:3].mean(dim=0)
             n *= y[:,:3].std(dim=0)
-
         u = torch.rand(y.shape[0], device=device)
         t = (torch.cos(u * (torch.pi / 2)) ** 2).to(device)
-
         #t = torch.rand(n.shape[0], device=device)
         path_sample = path.sample(t=t, x_0=n, x_1=y)
-
         V_y = model(x=path_sample.x_t, sigma=path_sample.t)
+
         loss = torch.mean((V_y - path_sample.dx_t)**2)
         loss_value = loss.item()
 
@@ -445,16 +451,18 @@ def train(args, device):
 
     logging.info(f"Start training for {args.epochs} epochs")
     
-    mesh= normalize_mesh(trimesh.load(args.data_path))  
+    mesh= normalize_mesh(trimesh.load(args.data_path)) 
+    mesh.vertices=mesh.vertices#@np.array([[1,0,0],[0,1,0],[0,0,-1]])
     start_time = time.time()
     path= AffineProbPath(scheduler=CondOTScheduler())
 
     for epoch in range(args.start_epoch, args.epochs):
         # Train for one epoch
         if args.method=='FM':
+            feats=torch.tensor(compute_geodesic_distances(mesh,lm)).to(device)
             train_stats = train_one_epoch_FM(
                 model, data_loader_train, optimizer, device, epoch, loss_scaler,
-                args.clip_grad, log_writer=None, args=args,path=path, mesh=mesh
+                args.clip_grad, log_writer=None, args=args,path=path, mesh=mesh,feats=feats
             )
         else:
             train_stats = train_one_epoch(
@@ -471,7 +479,7 @@ def train(args, device):
                     misc.save_model(args=args, model=model,model_without_ddp=model, optimizer=optimizer, loss_scaler=loss_scaler, epoch=epoch)
 
             if args.distribution == 'Gaussian':
-                noise = torch.randn(args.num_points_inference, 3).to(device)
+                noise = torch.randn(args.num_points_inference, 8).to(device)
 
             elif args.distribution == 'Sphere':
                 #if args.method == 'FM':
@@ -492,11 +500,11 @@ def train(args, device):
 
             model.eval()
             with torch.no_grad():
-                sample = model.sample(batch_seeds=noise, num_steps=args.num_steps)
+                sample = model.sample(batch_seeds=noise, num_steps=args.num_steps)[:,:3].to(torch.double)
             with open(os.path.join(args.output_dir, "chamfer_distance.txt"), mode="a", encoding="utf-8") as f:
-                f.write(f"Epoch {epoch}: Chamfer distance: {chamfer_dist(sample[:,:3].unsqueeze(0).to(torch.double), torch.tensor(mesh.vertices).unsqueeze(0).to(device)).item()}\n")
+                f.write(f"Epoch {epoch}: Chamfer distance: {chamfer_dist(sample[:,:3], torch.tensor(mesh.vertices).unsqueeze(0).to(device)).item()}\n")
             with open(os.path.join(args.output_dir, "hausdorff_distance.txt"), mode="a", encoding="utf-8") as f:
-                f.write(f"Epoch {epoch}: Hausdorff distance: {hausdorff_dist(sample[:,:3].unsqueeze(0).to(torch.double), torch.tensor(mesh.vertices).unsqueeze(0).to(device)).item()}\n")
+                f.write(f"Epoch {epoch}: Hausdorff distance: {hausdorff_dist(sample[:,:3], torch.tensor(mesh.vertices).unsqueeze(0).to(device)).item()}\n")
         #Log stats
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()}, 'epoch': epoch}
         
@@ -510,72 +518,6 @@ def train(args, device):
 
 
 
-def inference(args, device):
-
-    #Load Final Model
-    model = models.__dict__[args.model](channels=3 if args.texture_path is None else 6, depth=args.depth,network=models.__dict__[args.network]())   
-    model.to(device)
-    model.load_state_dict(torch.load(args.output_dir + '/checkpoint-'+str(args.epochs-1)+'.pth', map_location=device,weights_only=False)['model'], strict=True)
-    
-    #Sample X_0
-
-    if args.distribution == 'Gaussian':
-        noise = torch.randn(args.num_points_inference, 3).to(device)
-
-    elif args.distribution == 'Sphere':
-        #if args.method == 'FM':
-        noise = sample_sphere_volume(
-                radius=1,
-                center=(0, 0, 0),
-                num_points=args.num_points_inference
-                ).to(device)
-    elif args.distribution == 'Gaussian_Optimized':
-        mesh= normalize_mesh(trimesh.load(args.data_path))  
-
-        n = torch.randn(args.num_points_inference, 3).cuda()
-        n += torch.tensor(mesh.vertices[:,:3],device=device)[:,:3].mean(dim=0)
-        n *= torch.tensor(mesh.vertices[:,:3],device=device)[:,:3].std(dim=0)
-        noise=n
-        #else:
-        #    n = torch.randn(args.num_points_inference, 3).cuda()
-        #    n = torch.nn.functional.normalize(n, dim=1)
-        #    noise = n / np.sqrt(1/3)
-    #Inference
-    with torch.no_grad():
-        sample,_ = model.sample(batch_seeds=noise, num_steps=args.num_steps, intermediate=True)
-    
-    start_end_subplot(noise.cpu(), sample.cpu())
-
-    # Check if the velocity field is constant along iterations
-    #velocity_changes = []
-    #for i in range(len(solutions) - 1):
-    #    velocity_similarity = torch.cosine_similarity(torch.tensor(solutions[i + 1] - solutions[i]), torch.tensor(solutions[1] - solutions[0]), dim=1).mean().item()
-    #    if velocity_similarity is not None:
-    #        print(f'Iteration {i} to {i + 1}, Average Velocity Similarity: {velocity_similarity}')
-    #        velocity_changes.append(velocity_similarity)
-    #    else:
-    #        velocity_changes.append(0)
-        #print(f'Iteration {i} to {i + 1}, Average Velocity Change: {velocity_diff}')
-    #import matplotlib.pyplot as plt
-    #import numpy as np
-
-    # Plot velocity similarity across iterations
-    #iterations = list(range(1, len(solutions) ))
-    #plt.figure(figsize=(10, 6))
-    #plt.plot(iterations, np.array(velocity_changes), marker='o', linestyle='-', color='b')
-    #plt.title('Velocity Similarity Across Iterations')
-    #plt.xlabel('Iteration')
-    #plt.ylabel('Average Velocity Similarity')
-    #plt.grid(True)
-    #plt.savefig(f'velocity-similarity.png')
-    #plt.close()
-    #print(f'Average Velocity Change Across All Iterations: {sum(velocity_changes) / len(velocity_changes)}')
-
-    
-    #Save Results
-    #trimesh.PointCloud(sample.detach().cpu().numpy()).export(os.path.join(args.output_dir, 'sample.ply'))
-
-
 def main():
     args = get_inline_arg()
     if args.output_dir:
@@ -585,9 +527,6 @@ def main():
     
     if args.train:
         train(args, device)
-
-    if args.inference:
-        inference(args, device)
 
 
 if __name__ == '__main__':
